@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable
@@ -40,8 +41,10 @@ from urllib3.util.retry import Retry
 # still starts without it (it then uses Python's built-in list).
 try:
     import truststore
-except ImportError:  # not installed, or Python 3.9
+    _truststore_import_error = ""
+except ImportError as import_error:  # not installed, or Python 3.9
     truststore = None
+    _truststore_import_error = str(import_error)
 
 # ---------------------------------------------------------------------------
 # General settings
@@ -89,11 +92,37 @@ def use_system_certificates() -> bool:
     return True
 
 
+def python_description() -> str:
+    """
+    The Python version and the full path of the Python program running SDS-Fetch.
+
+    A computer can have several Pythons installed (for example one started with
+    "python" and another with "py"). Each has its own packages, so a package
+    installed with one is invisible to the other. This path shows which one ran.
+    """
+    version = ".".join(str(number) for number in sys.version_info[:3])
+    return f"{version} ({sys.executable})"
+
+
 def certificate_store_description() -> str:
-    """One line for the log that says which certificate list is used."""
+    """
+    One line for the log that says which certificate list is used and, when it
+    is not the operating system's, why not and how to fix it.
+    """
     if _system_certificates_active:
         return "operating system certificate store (truststore)"
-    return "Python's built-in list (certifi) - install truststore on company networks"
+
+    reason = "Python's built-in list (certifi) - "
+    if sys.version_info < (3, 10):
+        return reason + (f"truststore needs Python 3.10 or newer, this is Python "
+                         f"{sys.version_info[0]}.{sys.version_info[1]}")
+    if truststore is None:
+        if "No module named" in _truststore_import_error:
+            # Quote the path because it often contains spaces ("Program Files").
+            return reason + (f'truststore is not installed for the Python shown on the "Python:" '
+                             f'line. Fix: "{sys.executable}" -m pip install truststore')
+        return reason + f"truststore could not be loaded ({_truststore_import_error})"
+    return reason + "truststore is installed but was not switched on"
 
 
 def describe_error(error: Exception) -> str:

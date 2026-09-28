@@ -48,6 +48,30 @@ When the run is finished, a message shows the totals and offers to open the down
   * **SUCCESSFUL:** CAS number, file name, chemical name from PubChem, the website it came from, the supplier, and whether the CAS number was found in the PDF text.
   * **FAILED:** valid CAS numbers without an SDS, plus the result from each website (e.g. `HTTP 403`, `no SDS found`). This tells you whether a site blocked the request or simply doesn't have the chemical.
   * **INVALID:** entries that are not CAS numbers or that fail the CAS check digit (usually a typo).
+  * **OUTDATED SDS:** downloaded or existing SDS files older than 3 years (see below).
+  * At the top, a `Python:` line with the version and location of the Python that ran the program, and a `Certificates:` line that says whether the Windows certificate store is used and, if not, why not and how to fix it.
+* `SDS_hazard_summary_<date>_<time>.csv`, which opens in Excel, with one row per CAS number in the order you entered them:
+
+  | Column | Content |
+  |---|---|
+  | Status | downloaded, already in folder, or no SDS found |
+  | Signal word | Danger, Warning, none (not classified) or not found |
+  | H-codes | GHS hazard statement codes, e.g. `H302, H319, H410` |
+  | Hazard statements | each code with its standard sentence, e.g. `H302 Harmful if swallowed` |
+  | Hazards read from | `Section 2`, or `whole SDS` when the Section 2 heading was not recognised |
+  | SDS date, Date type, Age | the revision date (or issue date if the SDS has no revision date) and its age in years |
+  | Outdated | `YES` when the SDS is more than 3 years old |
+
+## Hazard summary: how it works and its limits
+
+The program reads the text of each saved SDS and looks only at **Section 2 (Hazards identification)**, which holds the classification of the product itself. Other sections list hazards that do not apply to the product as a whole: Section 3 and Section 16 give those of individual ingredients, and Section 11 quotes toxicology data. It collects H-codes printed in the text (EU-style SDSs) and also recognises the standard English sentences of the GHS hazard statements, because US SDSs often print only the sentence. SDS files that already existed in the folder are read too, so the summary always covers the whole list.
+
+The summary is an overview for planning, not a substitute for reading Section 2:
+
+* Hazard pictograms are images and cannot be read. The H-codes carry the same information.
+* PDF text extraction is sometimes imperfect, and only English-language SDSs are understood. A scanned SDS gives `PDF text unreadable`.
+* Dates written as `05/12/2023` are read as US month/day/year unless the first number is above 12.
+* **Outdated** means older than 3 years. This is a common internal review interval, not a legal limit: OSHA HazCom sets no expiry date, and REACH requires suppliers to update an SDS when new hazard information becomes available. An old SDS can still be the current one for an unchanged product. Change `SDS_MAX_AGE_YEARS` at the top of [`sds_fetch/sds_info.py`](sds_fetch/sds_info.py) to use a different limit.
 
 ## How it works
 
@@ -75,7 +99,7 @@ When the run is finished, a message shows the totals and offers to open the down
 
 If the log says **NETWORK PROBLEM** or every website reports `security certificate refused`, your network intercepts HTTPS traffic. Many companies run a security proxy (Zscaler, Netskope, Palo Alto and similar) that decrypts HTTPS traffic for inspection and re-signs it with the company's own certificate. IT installs that certificate in Windows, so web browsers accept it. Python normally uses its own built-in certificate list instead, so it refuses every connection with `CERTIFICATE_VERIFY_FAILED ... self signed certificate in certificate chain`.
 
-The program fixes this with the [truststore](https://pypi.org/project/truststore/) package, which makes Python trust the same certificates as Windows. It is in `requirements.txt`, so run `python -m pip install -r requirements.txt` again after updating. The `Certificates:` line at the top of the log shows whether it is active. truststore needs Python 3.10 or newer. On Python 3.9, either upgrade Python or ask IT for the company root certificate as a `.pem` file and set the environment variable `REQUESTS_CA_BUNDLE` to its path.
+The program fixes this with the [truststore](https://pypi.org/project/truststore/) package, which makes Python trust the same certificates as Windows. It is in `requirements.txt`, so run `python -m pip install -r requirements.txt` again after updating. The `Certificates:` line at the top of the log shows whether it is active, and if not, why. A common cause is having more than one Python installed: packages installed with `py -m pip` are invisible to `python`, and the reverse. The `Python:` line shows which Python ran the program, and the `Certificates:` line then gives the exact install command for that Python. truststore needs Python 3.10 or newer. On Python 3.9, either upgrade Python or ask IT for the company root certificate as a `.pem` file and set the environment variable `REQUESTS_CA_BUNDLE` to its path.
 
 If `pip` itself fails with the same certificate error, first run `python -m pip install --upgrade pip`. pip 24.2 and newer already use the Windows certificate store.
 
@@ -102,7 +126,8 @@ run_sds_fetch.py             start the program
 sds_fetch/
     cas.py                   read the typed list / CSV, check CAS numbers
     sources.py               PubChem name lookup + one search function per SDS website
-    downloader.py            download, verify, save <CAS>.pdf, write the log
+    downloader.py            download, verify, save <CAS>.pdf, write the log and the hazard summary
+    sds_info.py              read signal word, H-codes and SDS date from the PDF text
     gui.py                   the window (Tkinter)
 examples/example_cas_list.csv
 tests/                       automated tests (no internet needed)

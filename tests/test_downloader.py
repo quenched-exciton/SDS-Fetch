@@ -200,3 +200,62 @@ def test_other_failures_do_not_trigger_network_warning(tmp_path):
                       session=FakeSession(), sources=[("A", blocked_source)], pause_seconds=0)
 
     assert "NETWORK PROBLEM" not in batch.log_path.read_text(encoding="utf-8-sig")
+
+
+# --- Hazard summary spreadsheet and outdated SDS ------------------------------
+
+# One-line SDS texts for make_pdf (it cannot handle brackets in the text).
+CURRENT_SDS = ("CAS 64-17-5 Revision Date 2025-06-01 SECTION 2: Hazards identification "
+               "Signal word Danger H225 Highly flammable liquid and vapour. "
+               "H319 Causes serious eye irritation. SECTION 3: Composition")
+OLD_SDS = ("CAS 7732-18-5 Revision Date 24-Dec-2015 SECTION 2: Hazards identification "
+           "Not a hazardous substance or mixture according to Regulation. Signal word none "
+           "SECTION 3: Composition")
+
+
+def test_run_batch_writes_hazard_summary_and_flags_old_sds(tmp_path):
+    import csv
+
+    parsed = parse_text_list("64-17-5\n7732-18-5\n67-64-1\n")
+    session = FakeSession({
+        "https://a.test/64-17-5.pdf": FakeResponse(200, make_pdf(CURRENT_SDS)),
+        "https://a.test/7732-18-5.pdf": FakeResponse(200, make_pdf(OLD_SDS)),
+    })
+
+    def source(cas, session):
+        return [SdsCandidate(f"https://a.test/{cas}.pdf", "Site A", "Maker A")]
+
+    messages = []
+    batch = run_batch(parsed, tmp_path, "test", report=messages.append, session=session,
+                      sources=[("A", source)], pause_seconds=0)
+
+    with batch.summary_path.open(encoding="utf-8-sig", newline="") as file:
+        rows = list(csv.DictReader(file))
+    assert [row["CAS Number"] for row in rows] == ["64-17-5", "7732-18-5", "67-64-1"]  # input order
+
+    ethanol, water, acetone = rows
+    assert ethanol["Status"] == "downloaded" and ethanol["SDS file"] == "64-17-5.pdf"
+    assert ethanol["Signal word"] == "Danger"
+    assert ethanol["H-codes"] == "H225, H319"
+    assert ethanol["Hazard statements"].startswith("H225 Highly flammable liquid and vapor;")
+    assert ethanol["Hazards read from"] == "Section 2"
+    assert (ethanol["SDS date"], ethanol["Date type"]) == ("2025-06-01", "revision")
+    assert water["H-codes"] == "none found" and water["Signal word"] == "none"
+    assert water["Hazards read from"] == "Section 2"   # short Section 2 of a non-hazardous substance
+    assert water["Outdated (> 3 years)"] == "YES"
+    assert acetone["Status"] == "no SDS found" and acetone["H-codes"] == ""
+
+    log_text = batch.log_path.read_text(encoding="utf-8-sig")
+    assert "Outdated SDS (older than 3 years): 1" in log_text
+    assert "OUTDATED SDS - older than 3 years (1)" in log_text
+    assert "2015-12-24 OUTDATED" in log_text
+    assert f"Hazard summary:   {batch.summary_path.name}" in log_text
+    assert "Python:" in log_text
+    assert any("Hazards: Danger: H225, H319" in m for m in messages)
+
+
+def test_existing_file_still_gets_hazard_info(tmp_path):
+    (tmp_path / "64-17-5.pdf").write_bytes(make_pdf(CURRENT_SDS))
+    result = process_one_cas("64-17-5", tmp_path, FakeSession(), report=silent, sources=[])
+    assert result.source == "already in folder"
+    assert result.info.hazard_codes == ["H225", "H319"]
