@@ -8,11 +8,11 @@ A small desktop program that downloads Safety Data Sheet (SDS) PDFs for a list o
 
 ## Installation
 
-You need Python 3.9 or newer.
+You need Python 3.9 or newer. Use Python 3.10 or newer on a company network (see *Company networks* below).
 
 1. **Install Python** from <https://www.python.org/downloads/>. On Windows, tick **"Add python.exe to PATH"** in the installer and keep the **"tcl/tk and IDLE"** option ticked; the program window is built with Tk.
 2. **Download this project**: on GitHub click **Code → Download ZIP** and unzip it, or run `git clone https://github.com/quenched-exciton/SDS-Fetch.git`.
-3. **Install the three helper packages** (requests, beautifulsoup4, pypdf). Open a terminal (Windows: *Command Prompt*) in the project folder and run:
+3. **Install the helper packages** (requests, beautifulsoup4, pypdf, truststore). Open a terminal (Windows: *Command Prompt*) in the project folder and run:
 
    ```
    python -m pip install -r requirements.txt
@@ -70,6 +70,16 @@ When the run is finished, a message shows the totals and offers to open the down
 * **Supplier websites change and some block automated downloads.** A website that is redesigned or starts refusing requests turns into `HTTP 403`, `no SDS found` or `search failed` messages in the log. The program then moves on to the next source. The website-reading code has automated tests against sample pages only, so a live website can behave differently. See *When a source stops working* below.
 * **Use the SDS for the product you actually bought.** An SDS downloaded by CAS number may come from a different supplier than your product. Grade, composition, hazard classification and revision date can differ. OSHA HazCom (29 CFR 1910.1200) and REACH require the SDS that ships with your purchased product, so treat these downloads as a reference.
 * **Check the supplier's terms of use.** Some websites restrict automated access. The program waits one second between chemicals and sends one request at a time, so keep your lists to a reasonable size.
+
+## Company networks
+
+If the log says **NETWORK PROBLEM** or every website reports `security certificate refused`, your network intercepts HTTPS traffic. Many companies run a security proxy (Zscaler, Netskope, Palo Alto and similar) that decrypts HTTPS traffic for inspection and re-signs it with the company's own certificate. IT installs that certificate in Windows, so web browsers accept it. Python normally uses its own built-in certificate list instead, so it refuses every connection with `CERTIFICATE_VERIFY_FAILED ... self signed certificate in certificate chain`.
+
+The program fixes this with the [truststore](https://pypi.org/project/truststore/) package, which makes Python trust the same certificates as Windows. It is in `requirements.txt`, so run `python -m pip install -r requirements.txt` again after updating. The `Certificates:` line at the top of the log shows whether it is active. truststore needs Python 3.10 or newer. On Python 3.9, either upgrade Python or ask IT for the company root certificate as a `.pem` file and set the environment variable `REQUESTS_CA_BUNDLE` to its path.
+
+If `pip` itself fails with the same certificate error, first run `python -m pip install --upgrade pip`. pip 24.2 and newer already use the Windows certificate store.
+
+Never switch certificate checking off to get around this: the program would then accept files from any server that pretends to be a supplier website.
 
 ## When a source stops working
 

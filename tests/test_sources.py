@@ -6,10 +6,14 @@ still look like this; see the README section "When a source stops working".
 """
 
 import pytest
+import requests
 
 from fakes import FakeResponse, FakeSession
 from sds_fetch.sources import (
+    REQUEST_TIMEOUT,
     SourceError,
+    create_session,
+    describe_error,
     lookup_chemical_name,
     parse_chemblink_page,
     parse_chemicalsafety_results,
@@ -111,3 +115,31 @@ def test_chemblink_finds_download_links_and_supplier():
     assert parse_chemblink_page(html, page_url) == [
         ("https://www.chemblink.com/MSDS/MSDSFiles/64-17-5_Sigma-Aldrich.pdf", "Sigma-Aldrich"),
     ]
+
+
+# --- Network error messages and connection settings -----------------------------
+
+def test_describe_error_shortens_common_network_errors():
+    certificate = requests.exceptions.SSLError(
+        "HTTPSConnectionPool(host='us.vwr.com', port=443): Max retries exceeded (Caused by SSLError("
+        "SSLCertVerificationError(1, '[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+        "self signed certificate in certificate chain (_ssl.c:1007)')))"
+    )
+    assert describe_error(certificate).startswith("security certificate refused (a company network proxy")
+
+    # requests reports a timeout wrapped inside a ConnectionError after retries.
+    wrapped_timeout = requests.exceptions.ConnectionError(
+        "HTTPSConnectionPool(host='us.vwr.com', port=443): Max retries exceeded (Caused by "
+        "ReadTimeoutError(\"HTTPSConnectionPool(host='us.vwr.com', port=443): Read timed out.\"))"
+    )
+    assert describe_error(wrapped_timeout) == f"no answer within {REQUEST_TIMEOUT} s (timed out)"
+    assert describe_error(requests.exceptions.ConnectionError("refused")).startswith("could not connect")
+
+    assert describe_error(SourceError("HTTP 403 from https://x.test")) == "HTTP 403 from https://x.test"
+    assert len(describe_error(ValueError("x" * 1000))) == 200
+
+
+def test_session_does_not_retry_after_a_read_timeout():
+    retry_rule = create_session().get_adapter("https://example.com").max_retries
+    assert retry_rule.read == 0     # a silent website costs one timeout, not three
+    assert retry_rule.total == 2    # busy servers (HTTP 503 etc.) are still retried

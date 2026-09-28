@@ -2,6 +2,8 @@
 
 import threading
 
+import requests
+
 from fakes import FakeResponse, FakeSession, make_pdf
 from sds_fetch.cas import parse_text_list
 from sds_fetch.downloader import pdf_mentions_cas, process_one_cas, run_batch
@@ -149,3 +151,52 @@ def test_stop_button_leaves_rest_unprocessed(tmp_path):
     assert [r.cas for r in batch.failures] == ["64-17-5"]
     assert batch.not_processed == ["7732-18-5"]
     assert "NOT PROCESSED" in batch.log_path.read_text(encoding="utf-8-sig")
+
+
+def test_certificate_errors_give_short_messages_and_a_network_warning(tmp_path):
+    # The same error a company security proxy caused in a real run on Windows.
+    raw_error = (
+        "HTTPSConnectionPool(host='www.fishersci.com', port=443): Max retries exceeded with url: "
+        "/us/en/catalog/search/sds?msdsKeyword=64-17-5 (Caused by SSLError(SSLCertVerificationError(1, "
+        "'[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self signed certificate in "
+        "certificate chain (_ssl.c:1007)')))"
+    )
+
+    def proxied_source(cas, session):
+        raise requests.exceptions.SSLError(raw_error)
+
+    def slow_source(cas, session):
+        raise requests.exceptions.ReadTimeout("Read timed out. (read timeout=20)")
+
+    messages = []
+    parsed = parse_text_list("64-17-5\n7732-18-5\n")
+    batch = run_batch(parsed, tmp_path, "test", report=messages.append, session=FakeSession(),
+                      sources=[("A", proxied_source), ("B", proxied_source), ("C", slow_source)],
+                      pause_seconds=0)
+
+    # Each source gets one short line instead of the raw error text.
+    attempts = batch.failures[0].attempts
+    assert [a for a in attempts if not a.startswith("PubChem")] == [
+        "A: security certificate refused (a company network proxy is probably re-signing HTTPS traffic)",
+        "B: security certificate refused (a company network proxy is probably re-signing HTTPS traffic)",
+        "C: no answer within 20 s (timed out)",
+    ]
+
+    # The progress box warns once, not once per chemical.
+    assert sum("WARNING" in m for m in messages) == 1
+
+    log_text = batch.log_path.read_text(encoding="utf-8-sig")
+    assert "NETWORK PROBLEM (2 CAS number(s))" in log_text
+    assert "Certificates:" in log_text
+    assert max(len(line) for line in log_text.splitlines()) < 150   # no more giant rows
+    assert "      A: security certificate refused" in log_text     # one indented line per source
+
+
+def test_other_failures_do_not_trigger_network_warning(tmp_path):
+    def blocked_source(cas, session):
+        raise SourceError("HTTP 403 from https://blocked.test")
+
+    batch = run_batch(parse_text_list("64-17-5\n"), tmp_path, "test", report=silent,
+                      session=FakeSession(), sources=[("A", blocked_source)], pause_seconds=0)
+
+    assert "NETWORK PROBLEM" not in batch.log_path.read_text(encoding="utf-8-sig")

@@ -38,12 +38,15 @@ from pypdf import PdfReader
 
 from .cas import ParsedInput, normalize_dashes
 from .sources import (
+    CERTIFICATE_PROBLEM,
     MAX_CANDIDATES_PER_SOURCE,
     REQUEST_TIMEOUT,
     SDS_SOURCES,
     SdsCandidate,
     SourceFunction,
+    certificate_store_description,
     create_session,
+    describe_error,
     lookup_chemical_name,
 )
 
@@ -89,6 +92,27 @@ class BatchResult:
     not_processed: list[str] = field(default_factory=list)  # left over after "Stop"
     log_path: Path | None = None
     cancelled: bool = False
+    certificate_warning_shown: bool = False  # the GUI warning is shown only once
+
+
+# Explanation written to the progress box and the log when websites are refused
+# because of their security certificate (see sources.use_system_certificates).
+NETWORK_WARNING = [
+    "websites refused the connection with a security-certificate error.",
+    "This is a network problem, not a missing SDS. Company networks often",
+    "re-sign HTTPS traffic with their own certificate. Fix: run",
+    "    python -m pip install -r requirements.txt",
+    "to install 'truststore' (needs Python 3.10 or newer), then run again.",
+    "If the 'Certificates:' line of the log already names truststore, ask IT",
+    "whether the proxy blocks these websites. See 'Company networks' in README.md.",
+]
+
+
+def failed_on_certificates(result: CasResult) -> bool:
+    """True when a CAS number failed and at least one SDS website refused its certificate."""
+    return result.status == "failed" and any(
+        CERTIFICATE_PROBLEM in attempt for attempt in result.attempts if not attempt.startswith("PubChem:")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +213,7 @@ def process_one_cas(
     try:
         result.chemical_name = lookup_chemical_name(cas, session) or ""
     except Exception as error:  # PubChem problems must never stop the SDS search
-        result.attempts.append(f"PubChem: {error}")
+        result.attempts.append(f"PubChem: {describe_error(error)}")
     if result.chemical_name:
         report(f"  Identified as: {result.chemical_name}")
     else:
@@ -204,8 +228,9 @@ def process_one_cas(
         try:
             candidates = find_function(cas, session)
         except Exception as error:  # network errors, blocked requests, changed pages
-            result.attempts.append(f"{source_name}: {error}")
-            report(f"    {source_name}: search failed ({error})")
+            message = describe_error(error)
+            result.attempts.append(f"{source_name}: {message}")
+            report(f"    {source_name}: search failed ({message})")
             continue
 
         if not candidates:
@@ -217,8 +242,9 @@ def process_one_cas(
             try:
                 pdf_bytes = download_pdf(candidate.url, session)
             except Exception as error:
-                result.attempts.append(f"{source_name}: download failed ({error})")
-                report(f"    {source_name}: download failed ({error})")
+                message = describe_error(error)
+                result.attempts.append(f"{source_name}: download failed ({message})")
+                report(f"    {source_name}: download failed ({message})")
                 continue
 
             found = pdf_mentions_cas(pdf_bytes, cas)
@@ -324,6 +350,11 @@ def run_batch(
             report(f"  Unexpected error for {cas}: {error}")
 
         (batch.successes if result.status == "success" else batch.failures).append(result)
+        if not batch.certificate_warning_shown and failed_on_certificates(result):
+            batch.certificate_warning_shown = True
+            report("  WARNING: " + NETWORK_WARNING[0])
+            for text in NETWORK_WARNING[1:]:
+                report("  " + text)
         if progress:
             progress(index + 1, total)
 
@@ -370,6 +401,7 @@ def write_log(
         f"Finished:         {finished:%Y-%m-%d %H:%M:%S}",
         f"Input:            {input_description}",
         f"Download folder:  {download_folder}",
+        f"Certificates:     {certificate_store_description()}",
         f"Entries read:     {parsed.entries_read}"
         + (f"  (duplicates ignored: {parsed.duplicates_ignored})" if parsed.duplicates_ignored else ""),
         "",
@@ -380,6 +412,11 @@ def write_log(
     ]
     if batch.cancelled:
         lines.append(f"  Not processed (run stopped by user): {len(batch.not_processed)}")
+
+    certificate_failures = sum(failed_on_certificates(r) for r in batch.failures)
+    if certificate_failures:
+        lines += ["", f"NETWORK PROBLEM ({certificate_failures} CAS number(s)): " + NETWORK_WARNING[0]]
+        lines += [f"  {text}" for text in NETWORK_WARNING[1:]]
 
     lines += ["", f"SUCCESSFUL ({len(batch.successes)})"]
     if batch.successes:
@@ -393,10 +430,10 @@ def write_log(
 
     lines += ["", f"FAILED ({len(batch.failures)})"]
     if batch.failures:
-        lines += _table(
-            ["CAS Number", "Chemical name (PubChem)", "What each source reported"],
-            [[r.cas, r.chemical_name or "-", "; ".join(r.attempts) or "-"] for r in batch.failures],
-        )
+        # Each CAS number gets a heading line, then one indented line per source.
+        for r in batch.failures:
+            lines.append(f"  {r.cas}  {r.chemical_name or '(no PubChem name)'}")
+            lines += [f"      {attempt}" for attempt in r.attempts] or ["      -"]
     else:
         lines.append("  (none)")
 
