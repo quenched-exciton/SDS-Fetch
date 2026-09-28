@@ -1,0 +1,4 @@
+# Settings for the test runner (pytest). Run all tests with:  python -m pytest
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

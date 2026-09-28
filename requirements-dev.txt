@@ -1,0 +1,5 @@
+# Extra packages needed only to run the automated tests:
+#   python -m pip install -r requirements-dev.txt
+#   python -m pytest
+-r requirements.txt
+pytest>=7.0
