@@ -13,6 +13,9 @@ For every CAS number the steps are:
   4. If no PDF contains the CAS number in its text (for example a scanned SDS
      with no text layer), the first PDF that the website linked to this exact CAS
      number is saved instead and marked "not verified" in the log.
+  5. The signal word, hazard statements (H-codes) and SDS date are read from the
+     saved PDF's text (see sds_info.py). They go into the hazard summary
+     spreadsheet, and SDS files older than SDS_MAX_AGE_YEARS are flagged.
 
 The GUI calls run_batch() from a background thread. run_batch() reports what it
 is doing through two "callback" functions supplied by the caller:
@@ -22,6 +25,7 @@ is doing through two "callback" functions supplied by the caller:
 
 from __future__ import annotations
 
+import csv
 import io
 import logging
 import os
@@ -37,6 +41,7 @@ import requests
 from pypdf import PdfReader
 
 from .cas import ParsedInput, normalize_dashes
+from .sds_info import SDS_MAX_AGE_YEARS, SdsInfo, describe_codes, read_sds_info
 from .sources import (
     CERTIFICATE_PROBLEM,
     MAX_CANDIDATES_PER_SOURCE,
@@ -48,6 +53,7 @@ from .sources import (
     create_session,
     describe_error,
     lookup_chemical_name,
+    python_description,
 )
 
 # pypdf prints warnings for slightly malformed PDFs (very common for SDS files).
@@ -81,6 +87,7 @@ class CasResult:
     cas_verified: str = ""             # "yes", "NO - check manually" or "-" (not checked)
     note: str = ""                     # extra information for the log
     attempts: list[str] = field(default_factory=list)  # what each source said
+    info: SdsInfo | None = None        # hazard codes and SDS date; None = PDF text unreadable
 
 
 @dataclass
@@ -91,6 +98,7 @@ class BatchResult:
     failures: list[CasResult] = field(default_factory=list)
     not_processed: list[str] = field(default_factory=list)  # left over after "Stop"
     log_path: Path | None = None
+    summary_path: Path | None = None   # the hazard summary spreadsheet (CSV)
     cancelled: bool = False
     certificate_warning_shown: bool = False  # the GUI warning is shown only once
 
@@ -154,6 +162,14 @@ def pdf_mentions_cas(pdf_bytes: bytes, cas: str) -> bool | None:
         False -> the text was readable but the CAS number was not in it
         None  -> no text could be read (scanned image, encrypted or damaged PDF)
     """
+    return cas_in_text(extract_pdf_text(pdf_bytes), cas)
+
+
+def extract_pdf_text(pdf_bytes: bytes) -> str | None:
+    """
+    Return the text of the first PAGES_TO_SEARCH pages, or None when no text
+    can be read (scanned image, encrypted or damaged PDF).
+    """
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
         page_texts = []
@@ -162,8 +178,12 @@ def pdf_mentions_cas(pdf_bytes: bytes, cas: str) -> bool | None:
         text = "\n".join(page_texts)
     except Exception:  # pypdf can raise many different errors for broken files
         return None
+    return text if text.strip() else None
 
-    if not text.strip():
+
+def cas_in_text(text: str | None, cas: str) -> bool | None:
+    """Same answers as pdf_mentions_cas, for text that was already extracted."""
+    if text is None:
         return None
 
     # PDF text extraction sometimes puts spaces around hyphens ("64 - 17 - 5")
@@ -182,6 +202,21 @@ def save_pdf(pdf_bytes: bytes, target: Path) -> None:
     temporary = target.with_name(target.name + ".part")
     temporary.write_bytes(pdf_bytes)
     os.replace(temporary, target)  # replaces an existing file on all systems
+
+
+def report_sds_info(result: CasResult, report: Callable[[str], None]) -> None:
+    """Show the signal word, H-codes and SDS date in the progress box."""
+    info = result.info
+    if info is None:
+        return
+    hazards = ", ".join(info.hazard_codes) or "no H-codes found"
+    signal = f"{info.signal_word}: " if info.signal_word and info.signal_word != "none" else ""
+    report(f"    Hazards: {signal}{hazards}")
+    if info.sds_date:
+        report(f"    SDS {info.date_kind} date {info.sds_date:%Y-%m-%d}"
+               + (f" - OUTDATED (older than {SDS_MAX_AGE_YEARS} years)" if info.outdated else ""))
+    else:
+        report("    SDS date not found in the PDF text")
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +242,12 @@ def process_one_cas(
         result.cas_verified = "-"
         result.note = "file already existed, not downloaded again"
         report(f"  {cas}.pdf already exists - skipped (tick 'Overwrite' to replace it).")
+        try:
+            text = extract_pdf_text(target.read_bytes())
+        except OSError:  # e.g. the file is open in another program and locked
+            text = None
+        result.info = read_sds_info(text) if text else None
+        report_sds_info(result, report)
         return result
 
     # --- Step 2: chemical identity from PubChem ----------------------------
@@ -247,7 +288,8 @@ def process_one_cas(
                 report(f"    {source_name}: download failed ({message})")
                 continue
 
-            found = pdf_mentions_cas(pdf_bytes, cas)
+            text = extract_pdf_text(pdf_bytes)
+            found = cas_in_text(text, cas)
             if found:
                 save_pdf(pdf_bytes, target)
                 result.status = "success"
@@ -257,6 +299,8 @@ def process_one_cas(
                 report(f"    Saved {target.name} from {candidate.source}"
                        + (f" ({candidate.supplier})" if candidate.supplier else "")
                        + " - CAS number confirmed in the PDF.")
+                result.info = read_sds_info(text)
+                report_sds_info(result, report)
                 return result
 
             if found is False:
@@ -327,6 +371,8 @@ def run_batch(
     download_folder.mkdir(parents=True, exist_ok=True)
     session = session or create_session()
     started = datetime.now()
+    report(f"Python: {python_description()}")
+    report(f"Certificates: {certificate_store_description()}")
     batch = BatchResult()
     total = len(parsed.valid_cas)
 
@@ -362,14 +408,83 @@ def run_batch(
         if index + 1 < total and result.source != "already in folder":
             time.sleep(pause_seconds)
 
+    batch.summary_path = write_hazard_summary(batch, parsed, download_folder, started)
     batch.log_path = write_log(batch, parsed, download_folder, input_description, started, datetime.now())
     report(f"Log file written: {batch.log_path}")
+    report(f"Hazard summary written: {batch.summary_path}")
     return batch
 
 
 # ---------------------------------------------------------------------------
 # Log file
 # ---------------------------------------------------------------------------
+
+def _date_cell(info: SdsInfo | None) -> str:
+    """'2021-12-24 OUTDATED', '2024-03-15' or '?' for the log table."""
+    if info is None or info.sds_date is None:
+        return "?"
+    return f"{info.sds_date:%Y-%m-%d}" + (" OUTDATED" if info.outdated else "")
+
+
+def write_hazard_summary(
+    batch: BatchResult,
+    parsed: ParsedInput,
+    download_folder: Path,
+    started: datetime,
+) -> Path:
+    """
+    Write the hazard summary spreadsheet (CSV, opens in Excel) and return its path.
+
+    One row per CAS number, in the order they were entered, including the failed
+    ones so the sheet covers the whole list.
+    """
+    summary_path = download_folder / f"SDS_hazard_summary_{started:%Y-%m-%d_%H-%M-%S}.csv"
+    results = {r.cas: r for r in batch.successes + batch.failures}
+    headers = [
+        "CAS Number", "Chemical name (PubChem)", "Status", "SDS file", "Supplier", "Found via",
+        "Signal word", "H-codes", "Hazard statements", "Hazards read from", "SDS date", "Date type",
+        "Age (years)", f"Outdated (> {SDS_MAX_AGE_YEARS} years)", "CAS in PDF",
+    ]
+
+    # newline="" is required by the csv module; utf-8-sig makes Excel show
+    # special characters correctly (see write_log).
+    with summary_path.open("w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.writer(file)
+        writer.writerow(headers)
+        for cas in parsed.valid_cas:
+            r = results.get(cas)
+            if r is None:  # not processed because the user pressed Stop
+                continue
+            info = r.info
+            if r.status != "success":
+                status = "no SDS found"
+            elif r.source == "already in folder":
+                status = "already in folder"
+            else:
+                status = "downloaded"
+            if info is None:
+                # Failed, or the PDF text could not be read (scanned SDS).
+                hazard_cells = ["", "", "", "PDF text unreadable" if r.status == "success" else "", "", "", "", ""]
+            else:
+                hazard_cells = [
+                    info.signal_word or "not found",
+                    ", ".join(info.hazard_codes) or "none found",
+                    describe_codes(info.hazard_codes),
+                    "Section 2" if info.section_2_found else "whole SDS (Section 2 not found)",
+                    f"{info.sds_date:%Y-%m-%d}" if info.sds_date else "not found",
+                    info.date_kind,
+                    f"{info.age_years:.1f}" if info.sds_date else "",
+                    "YES" if info.outdated else ("no" if info.sds_date else "unknown"),
+                ]
+            writer.writerow(
+                [r.cas, r.chemical_name, status,
+                 f"{r.cas}.pdf" if r.status == "success" else "",
+                 r.supplier, r.source]
+                + hazard_cells
+                + [r.cas_verified]
+            )
+    return summary_path
+
 
 def _table(headers: list[str], rows: list[list[str]]) -> list[str]:
     """Format rows as a plain-text table with aligned columns (readable in Notepad)."""
@@ -401,15 +516,23 @@ def write_log(
         f"Finished:         {finished:%Y-%m-%d %H:%M:%S}",
         f"Input:            {input_description}",
         f"Download folder:  {download_folder}",
+        f"Python:           {python_description()}",
         f"Certificates:     {certificate_store_description()}",
         f"Entries read:     {parsed.entries_read}"
         + (f"  (duplicates ignored: {parsed.duplicates_ignored})" if parsed.duplicates_ignored else ""),
+    ]
+    if batch.summary_path:
+        lines.append(f"Hazard summary:   {batch.summary_path.name}")
+    lines += [
         "",
         "SUMMARY",
         f"  Successful: {len(batch.successes)}",
         f"  Failed:     {len(batch.failures)}",
         f"  Invalid:    {len(parsed.invalid)}",
     ]
+    outdated = [r for r in batch.successes if r.info and r.info.outdated]
+    if outdated:
+        lines.append(f"  Outdated SDS (older than {SDS_MAX_AGE_YEARS} years): {len(outdated)}")
     if batch.cancelled:
         lines.append(f"  Not processed (run stopped by user): {len(batch.not_processed)}")
 
@@ -421,12 +544,20 @@ def write_log(
     lines += ["", f"SUCCESSFUL ({len(batch.successes)})"]
     if batch.successes:
         lines += _table(
-            ["CAS Number", "File", "Chemical name (PubChem)", "Found via", "Supplier", "CAS in PDF", "Note"],
+            ["CAS Number", "File", "Chemical name (PubChem)", "Found via", "Supplier", "CAS in PDF",
+             "SDS date", "Note"],
             [[r.cas, f"{r.cas}.pdf", r.chemical_name or "-", r.source, r.supplier or "-",
-              r.cas_verified, r.note] for r in batch.successes],
+              r.cas_verified, _date_cell(r.info), r.note] for r in batch.successes],
         )
     else:
         lines.append("  (none)")
+
+    if outdated:
+        lines += ["", f"OUTDATED SDS - older than {SDS_MAX_AGE_YEARS} years ({len(outdated)})",
+                  "  Ask the supplier for the current version, or tick 'Overwrite' and run again.",
+                  "  A newer SDS may not exist when the product is unchanged."]
+        lines += [f"  {r.cas}  {r.chemical_name or '(no PubChem name)'}  -  {r.info.date_kind} date "
+                  f"{r.info.sds_date:%Y-%m-%d} ({r.info.age_years:.1f} years)" for r in outdated]
 
     lines += ["", f"FAILED ({len(batch.failures)})"]
     if batch.failures:

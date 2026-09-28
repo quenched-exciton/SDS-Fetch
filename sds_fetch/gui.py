@@ -331,7 +331,8 @@ class SdsFetchApp:
         self.status_text.set(("Stopped: " if batch.cancelled else "Finished: ") + summary + ".")
 
         if messagebox.askyesno("SDS download finished",
-                               f"{summary}.\n\nLog file:\n{batch.log_path}\n\nOpen the download folder now?"):
+                               f"{summary}.\n\nLog file:\n{batch.log_path}\n\nHazard summary (opens in Excel):\n"
+                               f"{batch.summary_path}\n\nOpen the download folder now?"):
             open_folder(batch.log_path.parent)
 
 

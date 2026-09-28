@@ -143,3 +143,20 @@ def test_session_does_not_retry_after_a_read_timeout():
     retry_rule = create_session().get_adapter("https://example.com").max_retries
     assert retry_rule.read == 0     # a silent website costs one timeout, not three
     assert retry_rule.total == 2    # busy servers (HTTP 503 etc.) are still retried
+
+
+def test_certificate_description_explains_why_truststore_is_off(monkeypatch):
+    import sds_fetch.sources as sources
+
+    monkeypatch.setattr(sources, "_system_certificates_active", False)
+    monkeypatch.setattr(sources, "truststore", None)
+    monkeypatch.setattr(sources, "_truststore_import_error", "No module named 'truststore'")
+    monkeypatch.setattr(sources.sys, "version_info", (3, 12, 1))
+    text = sources.certificate_store_description()
+    assert "not installed for the Python shown" in text and "-m pip install truststore" in text
+
+    monkeypatch.setattr(sources.sys, "version_info", (3, 9, 13))
+    assert "needs Python 3.10 or newer, this is Python 3.9" in sources.certificate_store_description()
+
+    monkeypatch.setattr(sources, "_system_certificates_active", True)
+    assert sources.certificate_store_description() == "operating system certificate store (truststore)"
