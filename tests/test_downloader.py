@@ -3,9 +3,9 @@
 import threading
 
 from fakes import FakeResponse, FakeSession, make_pdf
-from sds_downloader.cas import parse_text_list
-from sds_downloader.downloader import pdf_mentions_cas, process_one_cas, run_batch
-from sds_downloader.sources import SdsCandidate, SourceError
+from sds_fetch.cas import parse_text_list
+from sds_fetch.downloader import pdf_mentions_cas, process_one_cas, run_batch
+from sds_fetch.sources import SdsCandidate, SourceError
 
 PUBCHEM_ETHANOL = "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/64-17-5/property/Title/JSON"
 

@@ -1,8 +1,8 @@
-# SDS Downloader
+# SDS Fetch
 
 A small desktop program that downloads Safety Data Sheet (SDS) PDFs for a list of chemicals, identified by CAS Registry Number. Each file is saved as `<CAS Number>.pdf` (for example `7758-99-8.pdf`) in a folder you choose. At the end, the program writes a log file in that folder that lists every CAS number as **successful**, **failed** or **invalid**.
 
-![SDS Downloader window](docs/screenshot.png)
+![SDS Fetch window](docs/screenshot.png)
 
 *Screenshot from a simulated run with offline test data.*
 
@@ -11,7 +11,7 @@ A small desktop program that downloads Safety Data Sheet (SDS) PDFs for a list o
 You need Python 3.9 or newer.
 
 1. **Install Python** from <https://www.python.org/downloads/>. On Windows, tick **"Add python.exe to PATH"** in the installer and keep the **"tcl/tk and IDLE"** option ticked; the program window is built with Tk.
-2. **Download this project**: on GitHub click **Code → Download ZIP** and unzip it, or run `git clone https://github.com/quenched-exciton/A-Chemists-First-Repo.git`.
+2. **Download this project**: on GitHub click **Code → Download ZIP** and unzip it, or run `git clone https://github.com/quenched-exciton/SDS-Fetch.git`.
 3. **Install the three helper packages** (requests, beautifulsoup4, pypdf). Open a terminal (Windows: *Command Prompt*) in the project folder and run:
 
    ```
@@ -25,10 +25,10 @@ You need Python 3.9 or newer.
 From the project folder:
 
 ```
-python run_sds_downloader.py
+python run_sds_fetch.py
 ```
 
-`python -m sds_downloader` does the same thing.
+`python -m sds_fetch` does the same thing.
 
 ## Using the window
 
@@ -73,7 +73,7 @@ When the run is finished, a message shows the totals and offers to open the down
 
 ## When a source stops working
 
-Each website has its own function in [`sds_downloader/sources.py`](sds_downloader/sources.py). The list at the bottom of that file sets the search order:
+Each website has its own function in [`sds_fetch/sources.py`](sds_fetch/sources.py). The list at the bottom of that file sets the search order:
 
 ```python
 SDS_SOURCES = [
@@ -88,8 +88,8 @@ Move a line up or down to change the order, or put `#` in front of a line to swi
 ## Project layout
 
 ```
-run_sds_downloader.py        start the program
-sds_downloader/
+run_sds_fetch.py             start the program
+sds_fetch/
     cas.py                   read the typed list / CSV, check CAS numbers
     sources.py               PubChem name lookup + one search function per SDS website
     downloader.py            download, verify, save <CAS>.pdf, write the log

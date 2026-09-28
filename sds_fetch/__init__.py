@@ -1,5 +1,5 @@
 """
-SDS Downloader - downloads Safety Data Sheet PDFs by CAS Registry Number.
+SDS Fetch - downloads Safety Data Sheet PDFs by CAS Registry Number.
 
 Modules:
     cas.py        - reads the CAS list (typed text or CSV) and checks each number
