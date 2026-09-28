@@ -2,7 +2,7 @@
 
 import pytest
 
-from sds_downloader.cas import (
+from sds_fetch.cas import (
     check_cas,
     extract_cas_numbers,
     has_valid_check_digit,

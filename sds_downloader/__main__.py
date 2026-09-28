@@ -1,5 +1,0 @@
-"""Lets you start the program with:  python -m sds_downloader"""
-
-from .gui import main
-
-main()

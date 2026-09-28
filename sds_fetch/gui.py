@@ -35,12 +35,12 @@ from .cas import ParsedInput, parse_csv_file, parse_text_list
 from .downloader import BatchResult, run_batch
 
 
-class SdsDownloaderApp:
+class SdsFetchApp:
     """The main window. Create it with a Tk root window, then call root.mainloop()."""
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        root.title("SDS Downloader")
+        root.title("SDS Fetch")
         root.minsize(640, 640)
 
         # "Tk variables" are linked to widgets: when the user types or clicks,
@@ -360,5 +360,5 @@ def main() -> None:
             pass
 
     root = tk.Tk()
-    SdsDownloaderApp(root)
+    SdsFetchApp(root)
     root.mainloop()

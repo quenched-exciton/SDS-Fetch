@@ -11,7 +11,7 @@ dist/
 venv/
 env/
 
-# Files the SDS Downloader creates (in case you download into this folder)
+# Files the SDS Fetch creates (in case you download into this folder)
 *.part
 SDS_download_log_*.txt
 

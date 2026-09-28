@@ -8,7 +8,7 @@ still look like this; see the README section "When a source stops working".
 import pytest
 
 from fakes import FakeResponse, FakeSession
-from sds_downloader.sources import (
+from sds_fetch.sources import (
     SourceError,
     lookup_chemical_name,
     parse_chemblink_page,
