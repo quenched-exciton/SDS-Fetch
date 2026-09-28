@@ -30,6 +30,19 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# "truststore" makes Python trust the same security certificates as Windows (or
+# macOS) itself. This matters on company networks: many of them run a security
+# proxy that decrypts and re-signs all HTTPS traffic with the company's own
+# certificate. Web browsers accept it because IT installed it in Windows, but
+# Python normally uses its own built-in certificate list and refuses every
+# connection with "CERTIFICATE_VERIFY_FAILED ... self signed certificate in
+# certificate chain". truststore needs Python 3.10 or newer, so the program
+# still starts without it (it then uses Python's built-in list).
+try:
+    import truststore
+except ImportError:  # not installed, or Python 3.9
+    truststore = None
+
 # ---------------------------------------------------------------------------
 # General settings
 # ---------------------------------------------------------------------------
@@ -50,6 +63,60 @@ BROWSER_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
 }
+
+
+# Short text written to the log when a website's security certificate is refused.
+# downloader.py searches for it to add a "network problem" note to the log.
+CERTIFICATE_PROBLEM = "security certificate refused"
+
+# Remembers whether the Windows certificate store is in use (see use_system_certificates).
+_system_certificates_active = False
+
+
+def use_system_certificates() -> bool:
+    """
+    Make every HTTPS connection trust the operating system's certificates.
+
+    Returns True when this worked and False when truststore is not available.
+    Calling it more than once is harmless.
+    """
+    global _system_certificates_active
+    if truststore is None:
+        return False
+    if not _system_certificates_active:
+        truststore.inject_into_ssl()  # affects the whole program, including requests
+        _system_certificates_active = True
+    return True
+
+
+def certificate_store_description() -> str:
+    """One line for the log that says which certificate list is used."""
+    if _system_certificates_active:
+        return "operating system certificate store (truststore)"
+    return "Python's built-in list (certifi) - install truststore on company networks"
+
+
+def describe_error(error: Exception) -> str:
+    """
+    Turn a network error into a short message for the log and the progress box.
+
+    The raw error text from requests is several hundred characters long and
+    repeats the full web address, so the common cases get a plain explanation.
+    Checking the text (not only the error type) also catches errors that
+    requests wraps inside other errors, such as a timeout inside "Max retries
+    exceeded".
+    """
+    text = str(error)
+    if "CERTIFICATE_VERIFY_FAILED" in text or isinstance(error, requests.exceptions.SSLError):
+        if "self signed certificate in certificate chain" in text or "self-signed certificate in certificate chain" in text:
+            return f"{CERTIFICATE_PROBLEM} (a company network proxy is probably re-signing HTTPS traffic)"
+        return f"{CERTIFICATE_PROBLEM} ({text[:120]})"
+    if isinstance(error, requests.exceptions.Timeout) or "timed out" in text.lower():
+        return f"no answer within {REQUEST_TIMEOUT} s (timed out)"
+    if isinstance(error, requests.exceptions.ConnectionError):
+        return "could not connect (website down, blocked, or no internet)"
+    # Anything else (e.g. SourceError "HTTP 403 ...") is already short; cap it anyway.
+    return text if len(text) <= 200 else text[:197] + "..."
 
 
 class SourceError(Exception):
@@ -78,12 +145,18 @@ def create_session() -> requests.Session:
     which makes repeated requests faster and helps with websites that set a cookie
     on the first visit. It is also set up to retry automatically (up to 2 times,
     waiting a little longer each time) when a server is temporarily unavailable.
+
+    A website that accepts the connection but then does not answer within
+    REQUEST_TIMEOUT seconds is NOT retried (read=0): retrying it only tripled the
+    waiting time for sites that were blocked or overloaded.
     """
+    use_system_certificates()
     session = requests.Session()
     session.headers.update(BROWSER_HEADERS)
 
     retry_rule = Retry(
         total=2,
+        read=0,                                  # do not retry after a read timeout
         backoff_factor=1.0,                      # wait 1 s, then 2 s between retries
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=("GET", "POST"),
