@@ -1,0 +1,4 @@
+# Install with:  python -m pip install -r requirements.txt
+requests>=2.31        # downloads web pages and files
+beautifulsoup4>=4.12  # reads (parses) the HTML of supplier search pages
+pypdf>=4.0            # reads the text inside downloaded PDFs to confirm the CAS number
