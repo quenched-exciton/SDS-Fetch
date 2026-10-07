@@ -1,8 +1,8 @@
-Chemical,CAS Number,Role in an acid copper plating bath
-Copper(II) sulfate pentahydrate,7758-99-8,Copper source
-Sulfuric acid,7664-93-9,Electrolyte
-Hydrochloric acid,7647-01-0,Chloride source
-Polyethylene glycol,25322-68-3,Suppressor
-"Bis(3-sulfopropyl) disulfide, disodium salt (SPS)",27206-35-5,Accelerator
-Janus Green B,2869-83-2,Leveler
-Deliberate typo to show the INVALID section of the log,7758-99-9,
+Chemical,CAS Number,Preferred supplier,Role in an acid copper plating bath
+Copper(II) sulfate pentahydrate,7758-99-8,Sigma-Aldrich,Copper source
+Sulfuric acid,7664-93-9,Thermo Fisher,Electrolyte
+Hydrochloric acid,7647-01-0,,Chloride source
+Polyethylene glycol,25322-68-3,,Suppressor
+"Bis(3-sulfopropyl) disulfide, disodium salt (SPS)",27206-35-5,,Accelerator
+Janus Green B,2869-83-2,,Leveler
+Deliberate typo to show the INVALID section of the log,7758-99-9,,

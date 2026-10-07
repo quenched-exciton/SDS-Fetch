@@ -259,3 +259,103 @@ def test_existing_file_still_gets_hazard_info(tmp_path):
     result = process_one_cas("64-17-5", tmp_path, FakeSession(), report=silent, sources=[])
     assert result.source == "already in folder"
     assert result.info.hazard_codes == ["H225", "H319"]
+
+
+# --- Choosing the manufacturer -----------------------------------------------
+
+def _sds_pdf(maker: str, cas: str = "2530-83-8") -> bytes:
+    """A one-line SDS whose Section 1 names `maker`."""
+    return make_pdf(f"SECTION 1: Identification Supplier {maker} CAS-No. {cas} "
+                    "SECTION 2: Hazards identification Signal word Warning H319 Causes serious eye "
+                    "irritation. SECTION 3: Composition")
+
+
+def _maker_session():
+    return FakeSession({
+        "https://a.test/sigma.pdf": FakeResponse(200, _sds_pdf("Sigma-Aldrich")),
+        "https://b.test/gelest.pdf": FakeResponse(200, _sds_pdf("Gelest, Inc.")),
+        "https://b.test/unnamed.pdf": FakeResponse(200, _sds_pdf("Gelest Inc")),
+    })
+
+
+SIGMA_SOURCE = ("A", source_returning(SdsCandidate("https://a.test/sigma.pdf", "Site A", "Sigma-Aldrich")))
+GELEST_SOURCE = ("B", source_returning(SdsCandidate("https://b.test/gelest.pdf", "Site B", "Gelest")))
+
+
+def test_requested_manufacturer_wins_over_an_earlier_source(tmp_path):
+    session = _maker_session()
+    result = process_one_cas("2530-83-8", tmp_path, session, report=silent,
+                             sources=[SIGMA_SOURCE, GELEST_SOURCE], preferences=["Gelest"])
+    assert (result.status, result.supplier, result.maker_match) == ("success", "Gelest", "yes")
+    assert result.requested == "Gelest"
+    assert "https://a.test/sigma.pdf" not in session.requested   # never downloaded
+
+
+def test_first_choice_found_early_skips_the_remaining_sources(tmp_path):
+    asked = []
+
+    def counting_source(cas, session):
+        asked.append(cas)
+        return []
+
+    result = process_one_cas("2530-83-8", tmp_path, _maker_session(), report=silent,
+                             sources=[GELEST_SOURCE, ("C", counting_source)], preferences=["Gelest"])
+    assert result.supplier == "Gelest"
+    assert asked == []                                           # source C was never asked
+
+
+def test_other_manufacturer_used_when_requested_one_has_no_sds(tmp_path):
+    result = process_one_cas("2530-83-8", tmp_path, _maker_session(), report=silent,
+                             sources=[SIGMA_SOURCE], preferences=["Gelest"])
+    assert (result.status, result.supplier, result.maker_match) == ("success", "Sigma-Aldrich", "no")
+    assert "no SDS from Gelest found" in result.note
+
+
+def test_strict_mode_saves_nothing_from_other_manufacturers(tmp_path):
+    result = process_one_cas("2530-83-8", tmp_path, _maker_session(), report=silent,
+                             sources=[SIGMA_SOURCE], preferences=["Gelest"], strict=True)
+    assert result.status == "failed"
+    assert not (tmp_path / "2530-83-8.pdf").exists()
+    assert "SDS offered by: Sigma-Aldrich (A)" in result.attempts
+
+
+def test_strict_mode_accepts_unnamed_link_when_pdf_names_the_manufacturer(tmp_path):
+    unnamed = ("B", source_returning(SdsCandidate("https://b.test/unnamed.pdf", "Site B", "")))
+    result = process_one_cas("2530-83-8", tmp_path, _maker_session(), report=silent,
+                             sources=[SIGMA_SOURCE, unnamed], preferences=["Gelest"], strict=True)
+    assert (result.status, result.maker_match) == ("success", "yes")
+
+
+def test_second_choice_is_used_before_unrequested_manufacturers(tmp_path):
+    tci = SdsCandidate("https://a.test/tci.pdf", "Site A", "TCI")
+    session = _maker_session()
+    session.pages["https://a.test/tci.pdf"] = FakeResponse(200, _sds_pdf("TCI"))
+    result = process_one_cas("2530-83-8", tmp_path, session, report=silent,
+                             sources=[("A", source_returning(tci)), SIGMA_SOURCE],
+                             preferences=["Gelest", "Merck"])   # Merck = Sigma-Aldrich
+    assert result.supplier == "Sigma-Aldrich"
+    assert result.requested == "Gelest, Sigma-Aldrich"
+
+
+def test_manufacturer_preferences_put_the_line_first_and_remove_repeats():
+    from sds_fetch.downloader import manufacturer_preferences
+
+    assert manufacturer_preferences("merck", ["Sigma-Aldrich", "TCI"]) == ["merck", "TCI"]
+    assert manufacturer_preferences("", ["TCI", " "]) == ["TCI"]
+
+
+def test_run_batch_uses_line_manufacturer_and_logs_it(tmp_path):
+    import csv
+
+    parsed = parse_text_list("2530-83-8 @ Gelest\n")
+    batch = run_batch(parsed, tmp_path, "test", report=silent, session=_maker_session(),
+                      sources=[SIGMA_SOURCE, GELEST_SOURCE], pause_seconds=0, preferred=["TCI"])
+    assert batch.successes[0].supplier == "Gelest"
+    assert batch.successes[0].requested == "Gelest, TCI"
+
+    log_text = batch.log_path.read_text(encoding="utf-8-sig")
+    assert "Manufacturers:    preferred TCI" in log_text
+    assert "From requested" in log_text
+    with batch.summary_path.open(encoding="utf-8-sig", newline="") as file:
+        row = next(csv.DictReader(file))
+    assert (row["Requested manufacturer"], row["From requested manufacturer"]) == ("Gelest, TCI", "yes")

@@ -17,6 +17,18 @@ For every CAS number the steps are:
      saved PDF's text (see sds_info.py). They go into the hazard summary
      spreadsheet, and SDS files older than SDS_MAX_AGE_YEARS are flagged.
 
+When manufacturers are requested (with "@ Gelest" on a line, or the "Preferred
+manufacturers" box), step 3 changes:
+  * SDS links from the first-choice manufacturer are tried as soon as a source
+    lists them. All other links are put aside.
+  * When every source has been asked and none of those worked, the links put
+    aside are tried: other requested manufacturers in the order given, then
+    links whose manufacturer the website did not name, then (unless "strict" is
+    ticked) every other manufacturer.
+  * Every saved PDF is checked for the manufacturer's name in its Section 1.
+    In strict mode a PDF is only saved when the website or the PDF names a
+    requested manufacturer.
+
 The GUI calls run_batch() from a background thread. run_batch() reports what it
 is doing through two "callback" functions supplied by the caller:
     report(message)          -> one line of text for the progress box
@@ -41,7 +53,8 @@ import requests
 from pypdf import PdfReader
 
 from .cas import ParsedInput, normalize_dashes
-from .sds_info import SDS_MAX_AGE_YEARS, SdsInfo, describe_codes, read_sds_info
+from .manufacturers import display_name, preference_rank
+from .sds_info import SDS_MAX_AGE_YEARS, SdsInfo, describe_codes, identification_section, read_sds_info
 from .sources import (
     CERTIFICATE_PROBLEM,
     MAX_CANDIDATES_PER_SOURCE,
@@ -88,6 +101,8 @@ class CasResult:
     note: str = ""                     # extra information for the log
     attempts: list[str] = field(default_factory=list)  # what each source said
     info: SdsInfo | None = None        # hazard codes and SDS date; None = PDF text unreadable
+    requested: str = ""                # requested manufacturer(s), e.g. "Gelest" ("" = any)
+    maker_match: str = ""              # whether the saved SDS is from a requested manufacturer
 
 
 @dataclass
@@ -101,6 +116,22 @@ class BatchResult:
     summary_path: Path | None = None   # the hazard summary spreadsheet (CSV)
     cancelled: bool = False
     certificate_warning_shown: bool = False  # the GUI warning is shown only once
+    preferred: list[str] = field(default_factory=list)  # "Preferred manufacturers" box
+    strict: bool = False
+
+
+def manufacturer_preferences(on_line: str, preferred: Sequence[str]) -> list[str]:
+    """
+    The manufacturers to ask for, most wanted first: the one written on the line
+    ("@ Gelest") and then the "Preferred manufacturers" box. Repeats are removed,
+    also when written differently ("Merck" and "Sigma-Aldrich" are the same company).
+    """
+    result: list[str] = []
+    for name in [on_line, *preferred]:
+        name = name.strip()
+        if name and display_name(name) not in [display_name(kept) for kept in result]:
+            result.append(name)
+    return result
 
 
 # Explanation written to the progress box and the log when websites are refused
@@ -223,6 +254,15 @@ def report_sds_info(result: CasResult, report: Callable[[str], None]) -> None:
 # One CAS number
 # ---------------------------------------------------------------------------
 
+def _maker_match_text(website_match: bool, pdf_match: bool) -> str:
+    """How sure we are that the SDS comes from a requested manufacturer (for the log)."""
+    if pdf_match:
+        return "yes"                       # Section 1 of the PDF names the manufacturer
+    if website_match:
+        return "website only"              # the website said so, the PDF text does not
+    return "no"
+
+
 def process_one_cas(
     cas: str,
     download_folder: Path,
@@ -230,10 +270,24 @@ def process_one_cas(
     overwrite: bool = False,
     report: Callable[[str], None] = print,
     sources: Sequence[tuple[str, SourceFunction]] = SDS_SOURCES,
+    preferences: Sequence[str] = (),
+    strict: bool = False,
 ) -> CasResult:
-    """Find, check and save the SDS for a single CAS number (see steps at the top)."""
+    """
+    Find, check and save the SDS for a single CAS number (see steps at the top).
+
+    preferences - manufacturers to prefer, most wanted first (empty = any)
+    strict      - True = only save an SDS from one of `preferences`
+    """
     result = CasResult(cas=cas)
     target = download_folder / f"{cas}.pdf"
+    preferences = list(preferences)
+    strict = strict and bool(preferences)
+    result.requested = ", ".join(display_name(name) for name in preferences)
+
+    def from_requested_maker(text: str | None) -> bool:
+        """True when Section 1 of the SDS text names a requested manufacturer."""
+        return bool(preferences and text) and preference_rank(preferences, identification_section(text)) is not None
 
     # --- Step 1: file already there? --------------------------------------
     if target.exists() and not overwrite:
@@ -247,6 +301,11 @@ def process_one_cas(
         except OSError:  # e.g. the file is open in another program and locked
             text = None
         result.info = read_sds_info(text) if text else None
+        if preferences:
+            result.maker_match = "yes" if from_requested_maker(text) else "not confirmed"
+            if result.maker_match != "yes":
+                result.note += f"; may not be from {result.requested} (tick 'Overwrite' to search again)"
+                report(f"    The existing file does not name {result.requested} - tick 'Overwrite' to search again.")
         report_sds_info(result, report)
         return result
 
@@ -259,10 +318,84 @@ def process_one_cas(
         report(f"  Identified as: {result.chemical_name}")
     else:
         report("  Not found in PubChem (normal for many polymers and mixtures) - searching anyway.")
+    if preferences:
+        report(f"  Requested manufacturer: {result.requested}"
+               + (" (strict: no other manufacturer)" if strict else ""))
 
     # --- Step 3: try each SDS source ---------------------------------------
     # Remember the first PDF we could not verify, in case nothing better turns up.
-    unverified_backup: tuple[bytes, SdsCandidate] | None = None
+    unverified_backup: tuple[bytes, SdsCandidate, bool] | None = None
+    makers_offered: list[str] = []   # e.g. "TCI (VWR)", listed in the log in strict mode
+
+    def try_candidate(source_name: str, candidate: SdsCandidate) -> bool:
+        """Download one link, check it, and save it if it is good. True = saved."""
+        nonlocal unverified_backup
+        try:
+            pdf_bytes = download_pdf(candidate.url, session)
+        except Exception as error:
+            message = describe_error(error)
+            result.attempts.append(f"{source_name}: download failed ({message})")
+            report(f"    {source_name}: download failed ({message})")
+            return False
+
+        text = extract_pdf_text(pdf_bytes)
+        found = cas_in_text(text, cas)
+        website_match = bool(preferences) and preference_rank(preferences, candidate.supplier) is not None
+        pdf_match = from_requested_maker(text)
+
+        if found:
+            if strict and not (website_match or pdf_match):
+                maker = candidate.supplier or "a manufacturer the website did not name"
+                result.attempts.append(f"{source_name}: SDS is from {maker}, not {result.requested} - skipped")
+                report(f"    {source_name}: SDS is from {maker}, not {result.requested} - skipped (strict)")
+                return False
+            save_pdf(pdf_bytes, target)
+            result.status = "success"
+            result.source = candidate.source
+            result.supplier = candidate.supplier
+            result.cas_verified = "yes"
+            if preferences:
+                result.maker_match = _maker_match_text(website_match, pdf_match)
+                if result.maker_match == "no":
+                    result.note = f"no SDS from {result.requested} found; saved another manufacturer's SDS"
+            report(f"    Saved {target.name} from {candidate.source}"
+                   + (f" ({candidate.supplier})" if candidate.supplier else "")
+                   + " - CAS number confirmed in the PDF.")
+            if preferences:
+                report(f"    From {result.requested}: {result.maker_match}")
+            result.info = read_sds_info(text)
+            report_sds_info(result, report)
+            return True
+
+        if found is False:
+            # Readable PDF, but for a different substance: never keep it.
+            result.attempts.append(f"{source_name}: PDF did not contain {cas}, rejected")
+            report(f"    {source_name}: PDF does not mention {cas} - rejected")
+        elif candidate.exact_match and not (strict and not website_match):
+            result.attempts.append(f"{source_name}: PDF text could not be read")
+            report(f"    {source_name}: PDF text could not be read - kept as a backup")
+            if unverified_backup is None:
+                unverified_backup = (pdf_bytes, candidate, website_match)
+        else:
+            # Unreadable PDF from a loose search hit (or, in strict mode, from a
+            # manufacturer we cannot confirm): too risky to keep.
+            result.attempts.append(f"{source_name}: unreadable PDF that could not be confirmed, rejected")
+            report(f"    {source_name}: PDF text could not be read and could not be confirmed - rejected")
+        return False
+
+    def rank(candidate: SdsCandidate) -> int:
+        """
+        Order in which links are tried when manufacturers are requested:
+        0, 1, ... = requested manufacturers in the order given,
+        len(preferences) = the website did not name the manufacturer,
+        len(preferences) + 1 = a different manufacturer.
+        """
+        position = preference_rank(preferences, candidate.supplier)
+        if position is not None:
+            return position
+        return len(preferences) if not candidate.supplier.strip() else len(preferences) + 1
+
+    put_aside: list[tuple[int, int, str, SdsCandidate]] = []  # (rank, order found, source, link)
 
     for source_name, find_function in sources:
         report(f"  Searching {source_name} ...")
@@ -279,59 +412,64 @@ def process_one_cas(
             report(f"    {source_name}: no SDS found")
             continue
 
-        for candidate in candidates[:MAX_CANDIDATES_PER_SOURCE]:
-            try:
-                pdf_bytes = download_pdf(candidate.url, session)
-            except Exception as error:
-                message = describe_error(error)
-                result.attempts.append(f"{source_name}: download failed ({message})")
-                report(f"    {source_name}: download failed ({message})")
-                continue
+        if not preferences:
+            # No manufacturer requested: try the links in the order the website gave them.
+            for candidate in candidates[:MAX_CANDIDATES_PER_SOURCE]:
+                if try_candidate(source_name, candidate):
+                    return result
+            continue
 
-            text = extract_pdf_text(pdf_bytes)
-            found = cas_in_text(text, cas)
-            if found:
-                save_pdf(pdf_bytes, target)
-                result.status = "success"
-                result.source = candidate.source
-                result.supplier = candidate.supplier
-                result.cas_verified = "yes"
-                report(f"    Saved {target.name} from {candidate.source}"
-                       + (f" ({candidate.supplier})" if candidate.supplier else "")
-                       + " - CAS number confirmed in the PDF.")
-                result.info = read_sds_info(text)
-                report_sds_info(result, report)
-                return result
+        for candidate in candidates:
+            label = f"{candidate.supplier or 'not named'} ({source_name})"
+            if label not in makers_offered:
+                makers_offered.append(label)
 
-            if found is False:
-                # Readable PDF, but for a different substance: never keep it.
-                result.attempts.append(f"{source_name}: PDF did not contain {cas}, rejected")
-                report(f"    {source_name}: PDF does not mention {cas} - rejected")
-            elif candidate.exact_match:
-                result.attempts.append(f"{source_name}: PDF text could not be read")
-                report(f"    {source_name}: PDF text could not be read - kept as a backup")
-                if unverified_backup is None:
-                    unverified_backup = (pdf_bytes, candidate)
+        # Up to MAX_CANDIDATES_PER_SOURCE links from requested manufacturers, and
+        # as many from the rest, so a long list cannot slow the run down.
+        ranked = [(rank(candidate), candidate) for candidate in candidates]
+        wanted = [item for item in ranked if item[0] < len(preferences)][:MAX_CANDIDATES_PER_SOURCE]
+        others = [item for item in ranked if item[0] >= len(preferences)][:MAX_CANDIDATES_PER_SOURCE]
+        if wanted:
+            report(f"    {source_name}: {len(wanted)} SDS link(s) from a requested manufacturer")
+        for position, candidate in wanted + others:
+            if position == 0:
+                if try_candidate(source_name, candidate):
+                    return result
+            elif strict and position > len(preferences):
+                continue  # strict mode: a manufacturer the website names, but not a requested one
             else:
-                # Unreadable PDF from a loose search hit: too risky to keep.
-                result.attempts.append(f"{source_name}: unreadable PDF from an inexact match, rejected")
-                report(f"    {source_name}: PDF text could not be read and the website did not "
-                       "confirm the CAS number - rejected")
+                put_aside.append((position, len(put_aside), source_name, candidate))
+
+    # Links put aside: next requested manufacturers, then unnamed, then others.
+    announced = False
+    for position, _, source_name, candidate in sorted(put_aside):
+        if position >= len(preferences) and not announced:
+            announced = True
+            report(f"  No usable SDS from {result.requested} - "
+                   + ("checking links whose manufacturer is not named." if strict
+                      else "trying other manufacturers."))
+        if try_candidate(source_name, candidate):
+            return result
 
     # --- Step 4: use the unverified backup, if there is one -----------------
     if unverified_backup is not None:
-        pdf_bytes, candidate = unverified_backup
+        pdf_bytes, candidate, website_match = unverified_backup
         save_pdf(pdf_bytes, target)
         result.status = "success"
         result.source = candidate.source
         result.supplier = candidate.supplier
         result.cas_verified = "NO - check manually"
         result.note = "PDF text unreadable (scanned?); CAS match comes from the website only"
+        if preferences:
+            result.maker_match = _maker_match_text(website_match, False)
         report(f"    Saved {target.name} from {candidate.source}, but the CAS number could "
                "not be confirmed inside the PDF - please check it by eye.")
         return result
 
     result.status = "failed"
+    if strict and makers_offered:
+        result.attempts.append("SDS offered by: " + ", ".join(makers_offered))
+        report(f"  No SDS from {result.requested}. Offered by: " + ", ".join(makers_offered))
     report(f"  No SDS found for {cas}.")
     return result
 
@@ -351,6 +489,8 @@ def run_batch(
     session: requests.Session | None = None,
     sources: Sequence[tuple[str, SourceFunction]] = SDS_SOURCES,
     pause_seconds: float = PAUSE_BETWEEN_CHEMICALS_SECONDS,
+    preferred: Sequence[str] = (),
+    strict: bool = False,
 ) -> BatchResult:
     """
     Download SDS files for every valid CAS number in `parsed`, then write the log.
@@ -360,6 +500,10 @@ def run_batch(
         download_folder   - folder where "<CAS>.pdf" files and the log are saved
         input_description - short text for the log, e.g. "CSV file: C:/lists/bath.csv"
         overwrite         - True = replace PDFs that already exist in the folder
+        preferred         - manufacturers to prefer for every CAS number, most wanted
+                            first. A manufacturer given on the line itself ("@ Gelest")
+                            comes before these.
+        strict            - True = only save SDS files from a requested manufacturer
         report            - function that receives progress messages (default: print)
         progress          - function that receives (number done, total number)
         stop_event        - when the GUI's Stop button sets this, we stop after
@@ -389,8 +533,10 @@ def run_batch(
             break
 
         report(f"[{index + 1}/{total}] {cas}")
+        preferences = manufacturer_preferences(parsed.manufacturers.get(cas, ""), preferred)
         try:
-            result = process_one_cas(cas, download_folder, session, overwrite, report, sources)
+            result = process_one_cas(cas, download_folder, session, overwrite, report, sources,
+                                     preferences, strict)
         except Exception as error:  # safety net: one bad chemical must not stop the run
             result = CasResult(cas=cas, attempts=[f"unexpected error: {error}"])
             report(f"  Unexpected error for {cas}: {error}")
@@ -409,6 +555,8 @@ def run_batch(
             time.sleep(pause_seconds)
 
     batch.summary_path = write_hazard_summary(batch, parsed, download_folder, started)
+    batch.preferred = [display_name(name) for name in preferred]
+    batch.strict = strict
     batch.log_path = write_log(batch, parsed, download_folder, input_description, started, datetime.now())
     report(f"Log file written: {batch.log_path}")
     report(f"Hazard summary written: {batch.summary_path}")
@@ -442,7 +590,7 @@ def write_hazard_summary(
     results = {r.cas: r for r in batch.successes + batch.failures}
     headers = [
         "CAS Number", "Chemical name (PubChem)", "Status", "SDS file", "Supplier", "Found via",
-        "Signal word", "H-codes", "Hazard statements", "Hazards read from", "SDS date", "Date type",
+        "Requested manufacturer", "From requested manufacturer", "Signal word", "H-codes", "Hazard statements", "Hazards read from", "SDS date", "Date type",
         "Age (years)", f"Outdated (> {SDS_MAX_AGE_YEARS} years)", "CAS in PDF",
     ]
 
@@ -479,7 +627,7 @@ def write_hazard_summary(
             writer.writerow(
                 [r.cas, r.chemical_name, status,
                  f"{r.cas}.pdf" if r.status == "success" else "",
-                 r.supplier, r.source]
+                 r.supplier, r.source, r.requested, r.maker_match]
                 + hazard_cells
                 + [r.cas_verified]
             )
@@ -523,6 +671,12 @@ def write_log(
     ]
     if batch.summary_path:
         lines.append(f"Hazard summary:   {batch.summary_path.name}")
+    any_requested = any(r.requested for r in batch.successes + batch.failures)
+    if any_requested:
+        lines.append("Manufacturers:    "
+                     + (f"preferred {', '.join(batch.preferred)}" if batch.preferred else "as given per line")
+                     + (" - strict (no other manufacturer)" if batch.strict else
+                        " - other manufacturers used when none found"))
     lines += [
         "",
         "SUMMARY",
@@ -543,12 +697,16 @@ def write_log(
 
     lines += ["", f"SUCCESSFUL ({len(batch.successes)})"]
     if batch.successes:
-        lines += _table(
-            ["CAS Number", "File", "Chemical name (PubChem)", "Found via", "Supplier", "CAS in PDF",
-             "SDS date", "Note"],
-            [[r.cas, f"{r.cas}.pdf", r.chemical_name or "-", r.source, r.supplier or "-",
-              r.cas_verified, _date_cell(r.info), r.note] for r in batch.successes],
-        )
+        headers = ["CAS Number", "File", "Chemical name (PubChem)", "Found via", "Supplier", "CAS in PDF",
+                   "SDS date", "Note"]
+        rows = [[r.cas, f"{r.cas}.pdf", r.chemical_name or "-", r.source, r.supplier or "-",
+                 r.cas_verified, _date_cell(r.info), r.note] for r in batch.successes]
+        if any_requested:
+            # Two extra columns before "Note": what was asked for, and whether we got it.
+            headers[-1:-1] = ["Requested", "From requested"]
+            for row, r in zip(rows, batch.successes):
+                row[-1:-1] = [r.requested or "-", r.maker_match or "-"]
+        lines += _table(headers, rows)
     else:
         lines.append("  (none)")
 
@@ -563,7 +721,8 @@ def write_log(
     if batch.failures:
         # Each CAS number gets a heading line, then one indented line per source.
         for r in batch.failures:
-            lines.append(f"  {r.cas}  {r.chemical_name or '(no PubChem name)'}")
+            lines.append(f"  {r.cas}  {r.chemical_name or '(no PubChem name)'}"
+                         + (f"  -  requested: {r.requested}" if r.requested else ""))
             lines += [f"      {attempt}" for attempt in r.attempts] or ["      -"]
     else:
         lines.append("  (none)")

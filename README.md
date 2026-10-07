@@ -12,7 +12,7 @@ You need Python 3.9 or newer. Use Python 3.10 or newer on a company network (see
 
 1. **Install Python** from <https://www.python.org/downloads/>. On Windows, tick **"Add python.exe to PATH"** in the installer and keep the **"tcl/tk and IDLE"** option ticked; the program window is built with Tk.
 2. **Download this project**: on GitHub click **Code → Download ZIP** and unzip it, or run `git clone https://github.com/quenched-exciton/SDS-Fetch.git`.
-3. **Install the helper packages** (requests, beautifulsoup4, pypdf, truststore). Open a terminal (Windows: *Command Prompt*) in the project folder and run:
+3. **Install the helper packages** (requests, beautifulsoup4, pypdf, truststore, openpyxl). Open a terminal (Windows: *Command Prompt*) in the project folder and run:
 
    ```
    python -m pip install -r requirements.txt
@@ -32,14 +32,46 @@ python run_sds_fetch.py
 
 ## Using the window
 
-1. **Choose the input method.** *Type or paste a list* shows a multi-line text box. *Load a CSV file* shows a file picker instead.
-2. **Enter the CAS numbers.**
-   * **Text box:** put one CAS number per line. Commas, semicolons, tabs or spaces between several numbers on one line also work. Anything else on the line is ignored, so you can paste two columns from Excel (for example `7758-99-8  Copper(II) sulfate pentahydrate`).
-   * **CSV file:** the program uses the column whose header contains "CAS" (such as `CAS`, `CAS No.` or `CAS Number`). If no header contains "CAS", it uses the first column. Comma-, semicolon- and tab-separated files all work. See [`examples/example_cas_list.csv`](examples/example_cas_list.csv).
+1. **Fill in the chemical list.** Type or paste one chemical per line:
+
+   ```
+   # Nickel bath additives
+   7758-99-8
+   2530-83-8 @ Gelest          # epoxy silane
+   81-07-2    Saccharin
+   ```
+
+   * `@ name` asks for that manufacturer's SDS (see *Choosing the manufacturer* below).
+   * Text after `#` is a note and is ignored, and so is a chemical name pasted next to the CAS number. You can paste two columns straight from Excel.
+   * Several CAS numbers on one line also work when separated by commas, semicolons, tabs or spaces.
+   * **Load CSV / Excel file…** reads a `.csv`, `.txt` or `.xlsx` file into the list, where you can check and edit it before running. It uses the column whose header contains "CAS" (otherwise the first column), a column headed "Manufacturer", "Supplier", "Brand" or "Vendor" for the `@` part, and a "Name" or "Chemical" column as the note. See [`examples/example_cas_list.csv`](examples/example_cas_list.csv).
+   * **Failed from last run** loads the CAS numbers that got no SDS in the last run (with their `@` manufacturers), so you can retry them after fixing a network problem.
+   * **The list is checked as you type.** Lines without a valid CAS number turn light red, repeated CAS numbers light yellow, and notes grey. The line below the box gives the count and the first problem. Old `.xls` files have to be saved as `.xlsx` or CSV first. If Excel has turned a CAS number into a date (for example 75-05-8 into 8 May 1975), the line shows `Excel date 1975-05-08`: retype it, and format the CAS column as *Text* in Excel to stop it happening again.
+2. **Choose the manufacturer (optional).** See below.
 3. **Choose the download folder.** Tick *Overwrite PDFs that already exist* if you want to replace SDS files you downloaded before. Otherwise the program skips them.
-4. **Press Run.** The progress panel at the bottom shows what the program is doing for each chemical. **Stop** finishes the current chemical and then stops; the log lists the unprocessed CAS numbers.
+4. **Press Run** (or Ctrl+Enter in the list). If some lines have problems, the program lists them and asks before it continues. The progress panel at the bottom shows what the program is doing for each chemical. **Stop** finishes the current chemical and then stops; the log lists the unprocessed CAS numbers.
 
 When the run is finished, a message shows the totals and offers to open the download folder.
+
+The window remembers the list, the folder, the manufacturer settings and the tick boxes until next time. They are saved in `.sds_fetch_settings.json` in your user folder (Windows: `C:\Users\<you>`); delete that file to start empty.
+
+## Choosing the manufacturer
+
+An SDS downloaded by CAS number may come from any manufacturer. If you need a particular one, for example the supplier you actually buy from, there are two ways to ask for it:
+
+* **For one chemical:** add `@` and the name to its line, e.g. `2530-83-8 @ Gelest`.
+* **For the whole list:** type names in the *Preferred* box, most wanted first, e.g. `Sigma-Aldrich, Thermo Fisher`. Lines with their own `@` name try that one first.
+
+Brand names count as their company: Merck, MilliporeSigma, Aldrich, Fluka and Supelco all mean Sigma-Aldrich; Acros, Alfa Aesar and Fisher mean Thermo Fisher; J.T. Baker and Macron mean Avantor / VWR. The full list is at the top of [`sds_fetch/manufacturers.py`](sds_fetch/manufacturers.py), where you can add more. Names that are not in the list are matched as typed, ignoring capitals and punctuation.
+
+How the program picks the SDS:
+
+1. As soon as a website lists an SDS from your first-choice manufacturer, the program downloads and checks it. If it is good, the remaining websites are not searched.
+2. Otherwise it asks all websites first, then tries your other requested manufacturers in order, then SDS files whose manufacturer the website does not name.
+3. Without **Strict**, if none of those works, it saves another manufacturer's SDS and the log says so (`From requested: no`). With **Strict**, it saves nothing from other manufacturers; the FAILED list then shows which manufacturers the websites did offer, so you can choose one.
+4. Every saved SDS is checked for the manufacturer's name in its Section 1. The log and the hazard summary say `yes` (named in the PDF), `website only` (the website said so, but the PDF text does not name it) or `no`.
+
+Limits: the program can only find manufacturers that its five websites carry. ChemicalSafety.com, VWR and ChemBlink list SDS files from many manufacturers; Fisher Scientific only has Thermo Fisher brands and Fluorochem only its own. A run with a requested manufacturer is slower when that manufacturer is not found early, because every website is searched before another manufacturer is accepted.
 
 ## What you get
 
@@ -55,6 +87,7 @@ When the run is finished, a message shows the totals and offers to open the down
   | Column | Content |
   |---|---|
   | Status | downloaded, already in folder, or no SDS found |
+  | Requested manufacturer, From requested manufacturer | what you asked for with `@` or *Preferred*, and whether the SDS is from it (`yes`, `website only`, `no`) |
   | Signal word | Danger, Warning, none (not classified) or not found |
   | H-codes | GHS hazard statement codes, e.g. `H302, H319, H410` |
   | Hazard statements | each code with its standard sentence, e.g. `H302 Harmful if swallowed` |
@@ -124,7 +157,9 @@ Move a line up or down to change the order, or put `#` in front of a line to swi
 ```
 run_sds_fetch.py             start the program
 sds_fetch/
-    cas.py                   read the typed list / CSV, check CAS numbers
+    cas.py                   read the list / CSV / Excel file, check CAS numbers
+    manufacturers.py         manufacturer names and their brands
+    settings.py              remember the window's settings
     sources.py               PubChem name lookup + one search function per SDS website
     downloader.py            download, verify, save <CAS>.pdf, write the log and the hazard summary
     sds_info.py              read signal word, H-codes and SDS date from the PDF text
