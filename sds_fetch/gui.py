@@ -138,12 +138,13 @@ class SdsFetchApp:
         ttk.Label(maker_frame,
                   text="For lines without @. Most wanted first, separated by commas, e.g. "
                        "\"Sigma-Aldrich, Thermo Fisher\". Brand names count as their company "
-                       "(Merck, Aldrich, Fluka = Sigma-Aldrich; Acros, Alfa Aesar = Thermo Fisher).",
+                       "(Merck, Aldrich, Fluka = Sigma-Aldrich; Acros, Alfa Aesar = Thermo Fisher). "
+                       "When no requested manufacturer has an SDS, another one's is saved, unless "
+                       "Strict is ticked.",
                   wraplength=620, justify="left").grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
         self.strict_check = ttk.Checkbutton(
             maker_frame, variable=self.strict,
-            text="Strict: only save SDS files from a requested manufacturer "
-                 "(otherwise another manufacturer's SDS is saved when none is found)")
+            text="Strict: only save SDS files from a requested manufacturer")
         self.strict_check.grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         # --- 3. Download folder ---------------------------------------------

@@ -4,7 +4,7 @@ A small desktop program that downloads Safety Data Sheet (SDS) PDFs for a list o
 
 ![SDS Fetch window](docs/screenshot.png)
 
-*Screenshot from a simulated run with offline test data.*
+*Screenshot from a simulated run with offline test data: an acid copper bath list with one manufacturer request (`@ Gelest`), preferred manufacturers, and a mistyped CAS number highlighted in red.*
 
 ## Installation
 

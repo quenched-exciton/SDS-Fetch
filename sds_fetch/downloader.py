@@ -362,7 +362,7 @@ def process_one_cas(
                    + (f" ({candidate.supplier})" if candidate.supplier else "")
                    + " - CAS number confirmed in the PDF.")
             if preferences:
-                report(f"    From {result.requested}: {result.maker_match}")
+                report(f"    From a requested manufacturer: {result.maker_match}")
             result.info = read_sds_info(text)
             report_sds_info(result, report)
             return True
