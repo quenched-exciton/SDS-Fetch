@@ -189,10 +189,10 @@ _SECTION_3_START = re.compile(r"(?i)(?:section\s*)?\b3\s*[.:)]?\s*composition")
 _SIGNAL_WORD = re.compile(r"(?i)signal\s*word\s*[:\-]?\s*(danger|warning|none|no signal word)")
 
 
-def hazard_section(text: str) -> tuple[str, bool]:
+def _section_2_bounds(text: str) -> tuple[int, int] | None:
     """
-    Return (the Section 2 text, True) when Section 2 can be found, otherwise
-    (the whole text, False).
+    Return (start, end) of the Section 2 text, or None when it cannot be found.
+    `start` is just after the heading; text[:heading position] is Section 1.
     """
     for start in _SECTION_2_START.finditer(text):
         end = _SECTION_3_START.search(text, start.end())
@@ -200,8 +200,31 @@ def hazard_section(text: str) -> tuple[str, bool]:
         # A very short "section" is a table of contents line such as
         # "2 Hazards identification ... 3 Composition": try the next heading.
         if len(section.strip()) >= 30:
-            return section, True
-    return text, False
+            return start.start(), end.start() if end else len(text)
+    return None
+
+
+def hazard_section(text: str) -> tuple[str, bool]:
+    """
+    Return (the Section 2 text, True) when Section 2 can be found, otherwise
+    (the whole text, False).
+    """
+    bounds = _section_2_bounds(text)
+    if bounds is None:
+        return text, False
+    heading = _SECTION_2_START.match(text, bounds[0])
+    return text[heading.end(): bounds[1]], True
+
+
+def identification_section(text: str) -> str:
+    """
+    Return Section 1 ("Identification"), which names the manufacturer or supplier.
+
+    When the Section 2 heading cannot be found, the first 3000 characters are
+    used instead (Section 1 is always at the very start of an SDS).
+    """
+    bounds = _section_2_bounds(text)
+    return text[: bounds[0]] if bounds else text[:3000]
 
 
 def find_signal_word(text: str) -> str:

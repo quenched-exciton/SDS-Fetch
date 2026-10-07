@@ -2,9 +2,10 @@
 gui.py - The single-window program the user sees.
 
 Layout, from top to bottom:
-    1. Input method   - radio buttons: "Type or paste a list" / "Load a CSV file"
-    2. CAS numbers    - EITHER a multi-line text box OR a CSV file picker
-                        (switches automatically when the radio button changes)
+    1. Chemicals      - the list (one CAS number per line, optional "@ manufacturer"),
+                        buttons to load a CSV/Excel file or the failed numbers of
+                        the last run, and a live check of the list below the box
+    2. Manufacturer   - preferred manufacturers + "strict" tick box (both optional)
     3. Download folder- folder picker + "Overwrite existing PDFs" tick box
     Run / Stop buttons
     Progress          - status line, progress bar and a running message log
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -31,8 +33,20 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
-from .cas import ParsedInput, parse_csv_file, parse_text_list
+from .cas import ParsedInput, parse_text_list, read_table_rows, rows_to_lines
 from .downloader import BatchResult, run_batch
+from .settings import load_settings, save_settings
+
+# Background colours for lines in the list (see _check_list).
+PROBLEM_COLOUR = "#ffd6d6"    # light red: no valid CAS number on this line
+DUPLICATE_COLOUR = "#fff1c2"  # light yellow: CAS number already listed above
+NOTE_COLOUR = "#7a7a7a"       # grey text: "# note"
+
+LIST_HELP = (
+    "One chemical per line, e.g. 7758-99-8. To ask for one manufacturer's SDS, add @ and its name: "
+    "2530-83-8 @ Gelest. Text after # is a note. Chemical names pasted next to the CAS number "
+    "are ignored. Ctrl+Enter starts the run."
+)
 
 
 class SdsFetchApp:
@@ -41,15 +55,22 @@ class SdsFetchApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         root.title("SDS Fetch")
-        root.minsize(640, 640)
+        root.minsize(680, 700)
+
+        settings = load_settings()
 
         # "Tk variables" are linked to widgets: when the user types or clicks,
         # the variable changes, and when we change the variable, the widget updates.
-        self.input_mode = tk.StringVar(value="text")    # "text" or "csv"
-        self.csv_path = tk.StringVar()
-        self.download_folder = tk.StringVar()
-        self.overwrite = tk.BooleanVar(value=False)
+        self.download_folder = tk.StringVar(value=settings["download_folder"])
+        self.preferred = tk.StringVar(value=settings["preferred_manufacturers"])
+        self.strict = tk.BooleanVar(value=settings["strict"])
+        self.overwrite = tk.BooleanVar(value=settings["overwrite"])
+        self.check_text = tk.StringVar()
         self.status_text = tk.StringVar(value="Ready. Enter CAS numbers, choose a folder, then press Run.")
+
+        self.loaded_from = ""                 # file the list was loaded from, for the log
+        self.last_failed_lines: list[str] = []  # for "Failed from last run"
+        self._check_pending = None            # timer id of the delayed list check
 
         # Communication with the worker thread (see the module description).
         self.messages: queue.Queue = queue.Queue()
@@ -57,7 +78,13 @@ class SdsFetchApp:
         self.worker: threading.Thread | None = None
 
         self._build_widgets()
-        self._show_input_panel()  # show the correct panel for the default choice
+        if settings["chemical_list"]:
+            self.cas_textbox.insert("1.0", settings["chemical_list"])
+            self.cas_textbox.edit_reset()  # so Ctrl+Z cannot undo the restored list away
+        self._check_list()
+        self.cas_textbox.focus_set()
+        # Save the settings when the window is closed with the X button.
+        root.protocol("WM_DELETE_WINDOW", self._close)
 
     # ------------------------------------------------------------------
     # Building the window
@@ -71,50 +98,53 @@ class SdsFetchApp:
         self.root.rowconfigure(0, weight=1)
         outer.columnconfigure(0, weight=1)
 
-        # --- 1. Input method -------------------------------------------------
-        mode_frame = ttk.LabelFrame(outer, text="1. How will you provide the CAS numbers?", padding=8)
-        mode_frame.grid(row=0, column=0, sticky="ew")
-        # "command=" runs _show_input_panel every time a radio button is clicked.
-        self.text_radio = ttk.Radiobutton(mode_frame, text="Type or paste a list", value="text",
-                                          variable=self.input_mode, command=self._show_input_panel)
-        self.csv_radio = ttk.Radiobutton(mode_frame, text="Load a CSV file", value="csv",
-                                         variable=self.input_mode, command=self._show_input_panel)
-        self.text_radio.grid(row=0, column=0, padx=(0, 24), sticky="w")
-        self.csv_radio.grid(row=0, column=1, sticky="w")
-
-        # --- 2. CAS numbers (two panels in the same place; only one is shown) --
-        list_frame = ttk.LabelFrame(outer, text="2. CAS numbers", padding=8)
-        list_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        # --- 1. Chemicals -------------------------------------------------------
+        list_frame = ttk.LabelFrame(outer, text="1. Chemicals", padding=8)
+        list_frame.grid(row=0, column=0, sticky="nsew")
         list_frame.columnconfigure(0, weight=1)
-        list_frame.rowconfigure(0, weight=1)
+        list_frame.rowconfigure(2, weight=1)
 
-        # Panel A: multi-line text box
-        self.text_panel = ttk.Frame(list_frame)
-        self.text_panel.columnconfigure(0, weight=1)
-        self.text_panel.rowconfigure(1, weight=1)
-        ttk.Label(self.text_panel,
-                  text="One CAS number per line, e.g. 7758-99-8. Commas, semicolons or spaces "
-                       "between numbers also work, and chemical names on the same line are ignored.",
-                  wraplength=580, justify="left").grid(row=0, column=0, sticky="w", pady=(0, 4))
-        self.cas_textbox = ScrolledText(self.text_panel, height=9, width=60, wrap="none", undo=True)
-        self.cas_textbox.grid(row=1, column=0, sticky="nsew")
+        buttons = ttk.Frame(list_frame)
+        buttons.grid(row=0, column=0, sticky="ew")
+        self.load_button = ttk.Button(buttons, text="Load CSV / Excel file...", command=self._load_file)
+        self.load_button.grid(row=0, column=0, padx=(0, 6))
+        self.failed_button = ttk.Button(buttons, text="Failed from last run", state="disabled",
+                                        command=self._load_failed)
+        self.failed_button.grid(row=0, column=1, padx=(0, 6))
+        self.clear_button = ttk.Button(buttons, text="Clear", command=self._clear_list)
+        self.clear_button.grid(row=0, column=2)
 
-        # Panel B: CSV file picker
-        self.csv_panel = ttk.Frame(list_frame)
-        self.csv_panel.columnconfigure(1, weight=1)
-        ttk.Label(self.csv_panel, text="CSV file:").grid(row=0, column=0, sticky="w")
-        self.csv_entry = ttk.Entry(self.csv_panel, textvariable=self.csv_path)
-        self.csv_entry.grid(row=0, column=1, sticky="ew", padx=6)
-        self.csv_button = ttk.Button(self.csv_panel, text="Browse...", command=self._browse_csv)
-        self.csv_button.grid(row=0, column=2)
-        ttk.Label(self.csv_panel,
-                  text="The column whose header contains \"CAS\" (e.g. \"CAS Number\") is used. "
-                       "If no header contains \"CAS\", the first column is used.",
-                  wraplength=580, justify="left").grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(list_frame, text=LIST_HELP, wraplength=620, justify="left").grid(
+            row=1, column=0, sticky="w", pady=(6, 4))
+        self.cas_textbox = ScrolledText(list_frame, height=10, width=60, wrap="none", undo=True)
+        self.cas_textbox.grid(row=2, column=0, sticky="nsew")
+        self.cas_textbox.tag_configure("problem", background=PROBLEM_COLOUR)
+        self.cas_textbox.tag_configure("duplicate", background=DUPLICATE_COLOUR)
+        self.cas_textbox.tag_configure("note", foreground=NOTE_COLOUR)
+        # "<<Modified>>" fires when the text changes; the list is checked shortly after.
+        self.cas_textbox.bind("<<Modified>>", self._list_changed)
+        self.cas_textbox.bind("<Control-Return>", self._run_from_keyboard)
 
-        # Both panels sit in the same grid cell; _show_input_panel hides one of them.
-        self.text_panel.grid(row=0, column=0, sticky="nsew")
-        self.csv_panel.grid(row=0, column=0, sticky="new")
+        self.check_label = ttk.Label(list_frame, textvariable=self.check_text, wraplength=620, justify="left")
+        self.check_label.grid(row=3, column=0, sticky="w", pady=(4, 0))
+
+        # --- 2. Manufacturer -------------------------------------------------------
+        maker_frame = ttk.LabelFrame(outer, text="2. Manufacturer (optional)", padding=8)
+        maker_frame.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        maker_frame.columnconfigure(1, weight=1)
+        ttk.Label(maker_frame, text="Preferred:").grid(row=0, column=0, sticky="w")
+        self.preferred_entry = ttk.Entry(maker_frame, textvariable=self.preferred)
+        self.preferred_entry.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        ttk.Label(maker_frame,
+                  text="For lines without @. Most wanted first, separated by commas, e.g. "
+                       "\"Sigma-Aldrich, Thermo Fisher\". Brand names count as their company "
+                       "(Merck, Aldrich, Fluka = Sigma-Aldrich; Acros, Alfa Aesar = Thermo Fisher).",
+                  wraplength=620, justify="left").grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.strict_check = ttk.Checkbutton(
+            maker_frame, variable=self.strict,
+            text="Strict: only save SDS files from a requested manufacturer "
+                 "(otherwise another manufacturer's SDS is saved when none is found)")
+        self.strict_check.grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         # --- 3. Download folder ---------------------------------------------
         folder_frame = ttk.LabelFrame(outer, text="3. Download folder", padding=8)
@@ -145,35 +175,121 @@ class SdsFetchApp:
         ttk.Label(progress_frame, textvariable=self.status_text).grid(row=0, column=0, sticky="w")
         self.progress_bar = ttk.Progressbar(progress_frame, mode="determinate")
         self.progress_bar.grid(row=1, column=0, sticky="ew", pady=6)
-        self.progress_log = ScrolledText(progress_frame, height=12, width=60, state="disabled",
+        self.progress_log = ScrolledText(progress_frame, height=10, width=60, state="disabled",
                                          wrap="word", font="TkFixedFont")
         self.progress_log.grid(row=2, column=0, sticky="nsew")
 
         # Let the two text areas share any extra space when the window is enlarged.
-        outer.rowconfigure(1, weight=1)
-        outer.rowconfigure(4, weight=2)
+        outer.rowconfigure(0, weight=1)
+        outer.rowconfigure(4, weight=1)
+
+    # ------------------------------------------------------------------
+    # The chemical list: live check, loading, clearing
+    # ------------------------------------------------------------------
+
+    def _list_text(self) -> str:
+        return self.cas_textbox.get("1.0", "end-1c")  # "end-1c" leaves out Tk's extra final newline
+
+    def _list_changed(self, _event=None) -> None:
+        """Called on every change of the list. Checks it 0.4 s after typing stops."""
+        self.cas_textbox.edit_modified(False)  # re-arm, or <<Modified>> fires only once
+        if self._check_pending is not None:
+            self.root.after_cancel(self._check_pending)
+        self._check_pending = self.root.after(400, self._check_list)
+
+    def _check_list(self) -> ParsedInput:
+        """
+        Check the list, colour the lines and show a summary below the box:
+        light red = no valid CAS number, light yellow = repeated, grey = note.
+        """
+        self._check_pending = None
+        text = self._list_text()
+        parsed = parse_text_list(text)
+
+        for tag in ("problem", "duplicate", "note"):
+            self.cas_textbox.tag_remove(tag, "1.0", "end")
+        for entry in parsed.invalid:
+            self.cas_textbox.tag_add("problem", f"{entry.line}.0", f"{entry.line}.end")
+        for line in parsed.duplicate_lines:
+            self.cas_textbox.tag_add("duplicate", f"{line}.0", f"{line}.end")
+        for number, line in enumerate(text.splitlines(), start=1):
+            if "#" in line:
+                self.cas_textbox.tag_add("note", f"{number}.{line.index('#')}", f"{number}.end")
+
+        # Summary line below the box.
+        if not parsed.valid_cas and not parsed.invalid:
+            self.check_text.set("The list is empty.")
+            self.check_label.configure(foreground="")
+            return parsed
+        summary = f"{len(parsed.valid_cas)} CAS number(s) ready"
+        if parsed.manufacturers:
+            summary += f", {len(parsed.manufacturers)} with a manufacturer"
+        summary += "."
+        if parsed.duplicates_ignored:
+            summary += f" {parsed.duplicates_ignored} repeat(s) will be skipped (yellow)."
+        if parsed.invalid:
+            first = parsed.invalid[0]
+            summary += (f" {len(parsed.invalid)} problem(s) in red - line {first.line}: "
+                        f"\"{first.text}\" - {first.reason}.")
+        self.check_text.set(summary)
+        self.check_label.configure(foreground="#b00020" if parsed.invalid else "#1b6e20")
+        return parsed
+
+    def _replace_or_add(self, lines: list[str], what: str) -> bool:
+        """Put `lines` in the list, asking first when the list is not empty. False = cancelled."""
+        new_text = "\n".join(lines)
+        if self._list_text().strip():
+            answer = messagebox.askyesnocancel(
+                what, f"Replace the current list with the {len(lines)} new line(s)?\n\n"
+                      "Yes = replace,  No = add them at the end,  Cancel = do nothing.\n"
+                      "(Ctrl+Z in the list undoes this.)")
+            if answer is None:
+                return False
+            if answer is False:
+                existing = self._list_text().rstrip("\n")
+                self.cas_textbox.insert("end", ("\n" if existing else "") + new_text)
+                self._check_list()
+                return True
+        self.cas_textbox.delete("1.0", "end")
+        self.cas_textbox.insert("1.0", new_text)
+        self._check_list()
+        return True
+
+    def _load_file(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Choose a CSV or Excel file with CAS numbers",
+            filetypes=[("CSV or Excel files", "*.csv *.xlsx *.xlsm *.txt"), ("All files", "*.*")],
+        )
+        if not path:  # empty when the user pressed Cancel
+            return
+        try:
+            lines = rows_to_lines(read_table_rows(path))
+        except Exception as error:  # damaged file, wrong format, missing openpyxl, ...
+            messagebox.showerror("Could not read the file", str(error))
+            return
+        if not lines:
+            messagebox.showwarning("Empty file", "No rows with content were found in this file.")
+            return
+        if self._replace_or_add(lines, "Load file"):
+            self.loaded_from = path
+            self.status_text.set(f"Loaded {len(lines)} line(s) from {Path(path).name}. "
+                                 "Check the list, then press Run.")
+
+    def _load_failed(self) -> None:
+        if not self.last_failed_lines:
+            return  # nothing failed (the button is normally greyed out then)
+        if self._replace_or_add(self.last_failed_lines, "Failed from last run"):
+            self.status_text.set(f"{len(self.last_failed_lines)} CAS number(s) from the last run "
+                                 "that got no SDS. Press Run to try them again.")
+
+    def _clear_list(self) -> None:
+        self.cas_textbox.delete("1.0", "end")  # Ctrl+Z brings it back
+        self.loaded_from = ""
+        self._check_list()
 
     # ------------------------------------------------------------------
     # Small helpers used by the buttons
     # ------------------------------------------------------------------
-
-    def _show_input_panel(self) -> None:
-        """Show the text box OR the CSV picker, depending on the radio button."""
-        if self.input_mode.get() == "text":
-            self.csv_panel.grid_remove()   # grid_remove hides a widget but remembers its place
-            self.text_panel.grid()
-            self.cas_textbox.focus_set()
-        else:
-            self.text_panel.grid_remove()
-            self.csv_panel.grid()
-
-    def _browse_csv(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Choose a CSV file with CAS numbers",
-            filetypes=[("CSV files", "*.csv"), ("Text files", "*.txt"), ("All files", "*.*")],
-        )
-        if path:  # empty when the user pressed Cancel
-            self.csv_path.set(path)
 
     def _browse_folder(self) -> None:
         path = filedialog.askdirectory(title="Choose the folder for the SDS files")
@@ -190,34 +306,33 @@ class SdsFetchApp:
     def _set_inputs_enabled(self, enabled: bool) -> None:
         """Lock the inputs while a download is running, unlock them afterwards."""
         state = "normal" if enabled else "disabled"
-        for widget in (self.text_radio, self.csv_radio, self.csv_entry, self.csv_button,
+        for widget in (self.load_button, self.clear_button, self.preferred_entry, self.strict_check,
                        self.folder_entry, self.folder_button, self.overwrite_check, self.run_button):
             widget.configure(state=state)
+        self.failed_button.configure(state="normal" if enabled and self.last_failed_lines else "disabled")
         self.cas_textbox.configure(state=state)
         self.stop_button.configure(state="disabled" if enabled else "normal")
+
+    def _preferred_list(self) -> list[str]:
+        """The "Preferred" box as a list: "Sigma, Thermo Fisher" -> ["Sigma", "Thermo Fisher"]."""
+        return [name.strip() for name in re.split(r"[,;]", self.preferred.get()) if name.strip()]
+
+    def _save_settings(self) -> None:
+        save_settings({
+            "download_folder": self.download_folder.get(),
+            "preferred_manufacturers": self.preferred.get(),
+            "strict": self.strict.get(),
+            "overwrite": self.overwrite.get(),
+            "chemical_list": self._list_text(),
+        })
+
+    def _close(self) -> None:
+        self._save_settings()
+        self.root.destroy()
 
     # ------------------------------------------------------------------
     # Run: check the inputs, then start the worker thread
     # ------------------------------------------------------------------
-
-    def _read_input(self) -> tuple[ParsedInput, str] | None:
-        """Read the CAS list from the text box or CSV file. Returns None on a problem."""
-        if self.input_mode.get() == "text":
-            text = self.cas_textbox.get("1.0", "end")
-            if not text.strip():
-                messagebox.showwarning("No CAS numbers", "Please type or paste at least one CAS number.")
-                return None
-            return parse_text_list(text), "typed/pasted list"
-
-        csv_file = self.csv_path.get().strip()
-        if not csv_file or not Path(csv_file).is_file():
-            messagebox.showwarning("No CSV file", "Please choose an existing CSV file.")
-            return None
-        try:
-            return parse_csv_file(csv_file), f"CSV file: {csv_file}"
-        except Exception as error:
-            messagebox.showerror("Could not read the CSV file", str(error))
-            return None
 
     def _check_folder(self) -> Path | None:
         """Make sure a usable download folder is chosen. Returns None on a problem."""
@@ -239,22 +354,42 @@ class SdsFetchApp:
                 return None
         return folder
 
+    def _run_from_keyboard(self, _event=None) -> str:
+        self._run()
+        return "break"  # stops Tk from also inserting a new line
+
     def _run(self) -> None:
-        """Called when the Run button is pressed."""
-        read = self._read_input()
-        if read is None:
-            return
-        parsed, input_description = read
+        """Called when the Run button (or Ctrl+Enter) is pressed."""
+        if str(self.run_button.cget("state")) == "disabled":
+            return  # a run is already going
+        parsed = self._check_list()
 
         if not parsed.valid_cas:
-            examples = "\n".join(f"  {entry.text}: {entry.reason}" for entry in parsed.invalid[:10])
-            messagebox.showerror("No valid CAS numbers",
-                                 "None of the entries is a valid CAS number.\n\n" + examples)
+            if not parsed.invalid:
+                messagebox.showwarning("No CAS numbers", "Please type, paste or load at least one CAS number.")
+            else:
+                examples = "\n".join(f"  line {e.line}: {e.text} - {e.reason}" for e in parsed.invalid[:10])
+                messagebox.showerror("No valid CAS numbers",
+                                     "None of the lines has a valid CAS number.\n\n" + examples)
+            return
+        if parsed.invalid and not messagebox.askyesno(
+                "Problems in the list",
+                f"{len(parsed.invalid)} entr{'y has' if len(parsed.invalid) == 1 else 'ies have'} a problem "
+                "(highlighted in red) and will be skipped:\n\n"
+                + "\n".join(f"  line {e.line}: {e.text} - {e.reason}" for e in parsed.invalid[:8])
+                + ("\n  ..." if len(parsed.invalid) > 8 else "")
+                + f"\n\nRun anyway with the {len(parsed.valid_cas)} valid CAS number(s)?"):
             return
 
         folder = self._check_folder()
         if folder is None:
             return
+        self._save_settings()
+
+        input_description = "list in the window"
+        if self.loaded_from:
+            input_description += f" (loaded from {self.loaded_from})"
+        preferred = self._preferred_list()
 
         # Reset the progress area for a fresh run.
         self.progress_log.configure(state="normal")
@@ -267,7 +402,9 @@ class SdsFetchApp:
 
         # daemon=True: if the user closes the window, the worker thread ends too.
         self.worker = threading.Thread(
-            target=self._worker, args=(parsed, folder, input_description, self.overwrite.get()), daemon=True)
+            target=self._worker,
+            args=(parsed, folder, input_description, self.overwrite.get(), preferred, self.strict.get()),
+            daemon=True)
         self.worker.start()
         self.root.after(100, self._check_queue)
 
@@ -281,7 +418,8 @@ class SdsFetchApp:
     # The worker thread and the message queue
     # ------------------------------------------------------------------
 
-    def _worker(self, parsed: ParsedInput, folder: Path, input_description: str, overwrite: bool) -> None:
+    def _worker(self, parsed: ParsedInput, folder: Path, input_description: str, overwrite: bool,
+                preferred: list[str], strict: bool) -> None:
         """Runs in the background thread. Only talks to the window through the queue."""
         try:
             batch = run_batch(
@@ -292,6 +430,8 @@ class SdsFetchApp:
                 report=lambda message: self.messages.put(("log", message)),
                 progress=lambda done, total: self.messages.put(("progress", (done, total))),
                 stop_event=self.stop_event,
+                preferred=preferred,
+                strict=strict,
             )
             self.messages.put(("done", (batch, parsed)))
         except Exception:
@@ -323,12 +463,18 @@ class SdsFetchApp:
 
     def _finished(self, batch: BatchResult, parsed: ParsedInput) -> None:
         """Show the summary when the worker is done."""
+        # Remember what got no SDS (keeping any "@ manufacturer") for "Failed from last run".
+        retry = [r.cas for r in batch.failures] + list(batch.not_processed)
+        self.last_failed_lines = [
+            f"{cas} @ {parsed.manufacturers[cas]}" if cas in parsed.manufacturers else cas for cas in retry]
+
         self._set_inputs_enabled(True)
         summary = (f"{len(batch.successes)} successful, {len(batch.failures)} failed, "
                    f"{len(parsed.invalid)} invalid")
         if batch.cancelled:
             summary += f", {len(batch.not_processed)} not processed (stopped)"
-        self.status_text.set(("Stopped: " if batch.cancelled else "Finished: ") + summary + ".")
+        self.status_text.set(("Stopped: " if batch.cancelled else "Finished: ") + summary + "."
+                             + (" 'Failed from last run' loads the rest." if retry else ""))
 
         if messagebox.askyesno("SDS download finished",
                                f"{summary}.\n\nLog file:\n{batch.log_path}\n\nHazard summary (opens in Excel):\n"
